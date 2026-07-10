@@ -1,0 +1,13 @@
+node_modules
+.next
+HydroRIVERS_v10_as_shp
+kazakhstan-260513-free
+*.xlsx
+*.shp
+*.dbf
+*.shx
+*.prj
+*.cpg
+rivers_akmola.geojson
+rivers_akmola_clipped.geojson
+akmola_border.geojson

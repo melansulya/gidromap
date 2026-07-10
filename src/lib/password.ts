@@ -1,0 +1,15 @@
+import crypto from "crypto";
+
+// PBKDF2 — secure password hashing, no external dependencies
+export function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.pbkdf2Sync(password, salt, 100_000, 64, "sha512").toString("hex");
+  return `${salt}:${hash}`;
+}
+
+export function verifyPassword(password: string, stored: string): boolean {
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash) return false;
+  const verify = crypto.pbkdf2Sync(password, salt, 100_000, 64, "sha512").toString("hex");
+  return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(verify, "hex"));
+}
