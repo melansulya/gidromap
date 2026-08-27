@@ -964,10 +964,23 @@ type DeepSeekMessage = {
 // Keeps the most recent messages, then drops any leading "tool" messages —
 // a tool result is only valid immediately after the assistant message that
 // requested it, so a slice can't safely start mid-tool-exchange.
-function trimPriorForLocalModel(prior: DeepSeekMessage[], maxMessages = 8): DeepSeekMessage[] {
+//
+// Also shortens older assistant replies: testing on-hardware showed even one
+// prior *verbose* text answer (a paragraph of prose) reliably threw off the next
+// turn's tool selection on small local models — they'd narrate what tool *should*
+// be called instead of calling it. Truncating old assistant prose to a short
+// summary keeps just enough for pronoun references ("этот район") without
+// drowning the next tool decision in leftover explanation text.
+function trimPriorForLocalModel(prior: DeepSeekMessage[], maxMessages = 4): DeepSeekMessage[] {
   let trimmed = prior.slice(-maxMessages);
   while (trimmed.length > 0 && trimmed[0].role === "tool") trimmed = trimmed.slice(1);
-  return trimmed;
+  return trimmed.map((m, i) => {
+    const isLast = i === trimmed.length - 1;
+    if (!isLast && m.role === "assistant" && m.content && m.content.length > 150) {
+      return { ...m, content: `${m.content.slice(0, 150)}…` };
+    }
+    return m;
+  });
 }
 
 async function runAgent(
