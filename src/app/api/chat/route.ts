@@ -1042,7 +1042,10 @@ async function runAgent(
         messages,
         tools: TOOLS,
         tool_choice: "auto",
-        max_tokens: 1200,
+        // Generation is the slow half of every local-inference turn (a 219-token
+        // reply took 88 of 131 total seconds in testing) — cap it tighter than
+        // DeepSeek's budget to keep worst-case answers from running long.
+        max_tokens: LLM_BACKEND === "ollama" ? 350 : 1200,
       }),
     });
 
