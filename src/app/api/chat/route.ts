@@ -804,9 +804,21 @@ function isRateLimited(key: string): boolean {
   return false;
 }
 
-// ─── DeepSeek agent ───────────────────────────────────────────────────────────
+// ─── LLM agent ────────────────────────────────────────────────────────────────
 
-const MODEL = process.env.DEEPSEEK_MODEL ?? "deepseek-chat";
+// LLM_BACKEND=ollama switches to a locally-hosted model via Ollama's OpenAI-compatible
+// endpoint (same request/response shape as DeepSeek, so runAgent needs no branching
+// beyond the base URL/model/auth below). Kept behind an env flag rather than replacing
+// DeepSeek outright so it's a one-line rollback if the local model underperforms.
+const LLM_BACKEND = process.env.LLM_BACKEND === "ollama" ? "ollama" : "deepseek";
+const MODEL =
+  LLM_BACKEND === "ollama"
+    ? (process.env.OLLAMA_MODEL ?? "qwen2.5:3b-instruct-q4_K_M")
+    : (process.env.DEEPSEEK_MODEL ?? "deepseek-chat");
+const LLM_ENDPOINT =
+  LLM_BACKEND === "ollama"
+    ? `${process.env.OLLAMA_BASE_URL ?? "http://localhost:11434"}/v1/chat/completions`
+    : "https://api.deepseek.com/chat/completions";
 
 type RegionMeta = {
   regionTitle: string;
@@ -851,9 +863,24 @@ const REGION_META: Record<Region, RegionMeta> = {
   },
 };
 
-function buildSystemPrompt(region: Region): string {
+function buildSystemPrompt(region: Region, includeDataDump: boolean): string {
   const meta = REGION_META[region];
   const posts = hydropostsFor(region);
+  const dataSection = includeDataDump
+    ? `Текущие данные гидропостов:
+${JSON.stringify(
+  posts.map((p) => ({
+    code: p.code,
+    label: p.label,
+    waterBody: p.waterBody,
+    district: p.district,
+    status: p.status,
+    waterLevel: p.waterLevel,
+  })),
+  null,
+  0,
+)}`
+    : `Данные по гидропостам сюда не включены (чтобы не раздувать промпт) — если нужен полный список постов с их статусом/уровнем, вызови filter_hydroposts(status="any").`;
   return `Ты — AI-ассистент AI Gidromap, интерактивной карты мониторинга гидропостов ${meta.regionTitle} Казахстана.
 
 ━━ ДАННЫЕ В СИСТЕМЕ ━━
@@ -923,19 +950,7 @@ get_river_widths — реки/участки рек шириной от зада
 - Если в запросе есть данные о погоде — используй их при анализе гидрологической ситуации. Осадки за 24 ч ≥ 20 мм — высокий риск подъёма уровней через 12–48 ч. Снеготаяние (оценка температурным методом, не измерение) ≥ 15 мм воды за 24 ч — также высокий риск подъёма уровней, особенно весной.
 - В данных НЕТ информации о том, какой пост выше или ниже по течению относительно другого, и нет связей между постами вообще — только code, label, waterBody, district, status, waterLevel по каждому посту отдельно. Никогда не утверждай, что один пост "upstream"/"downstream" по отношению к другому, что "волна" или изменение уровня дойдёт от одного поста до другого, или любую другую причинно-следственную связь между постами — таких данных нет, и придумывать их нельзя. Если вопрос требует именно такой связи (влияние одного поста/города на другой, порядок по течению и т.п.) — прямо ответь, что для этого вывода нет данных в системе, вместо того чтобы предполагать.
 
-Текущие данные гидропостов:
-${JSON.stringify(
-  posts.map((p) => ({
-    code: p.code,
-    label: p.label,
-    waterBody: p.waterBody,
-    district: p.district,
-    status: p.status,
-    waterLevel: p.waterLevel,
-  })),
-  null,
-  0,
-)}`;
+${dataSection}`;
 }
 
 type DeepSeekMessage = {
@@ -952,12 +967,15 @@ async function runAgent(
   region: Region,
 ): Promise<{ answer: string; mapUpdate: Partial<MapState> | null }> {
   const key = process.env.DEEPSEEK_API_KEY;
-  if (!key) throw new Error("DEEPSEEK_API_KEY missing");
+  if (LLM_BACKEND === "deepseek" && !key) throw new Error("DEEPSEEK_API_KEY missing");
 
   const prior = getSessionMessages(sessionId);
 
+  // The hydropost data dump is the single biggest cost on CPU-only local inference
+  // (see qwen-local-llm-benchmark) — only DeepSeek's cloud inference can afford it
+  // unconditionally. Ollama-backed sessions fall back to the filter_hydroposts tool.
   const messages: DeepSeekMessage[] = [
-    { role: "system", content: buildSystemPrompt(region) },
+    { role: "system", content: buildSystemPrompt(region, LLM_BACKEND !== "ollama") },
     ...prior,
   ];
 
@@ -968,11 +986,11 @@ async function runAgent(
 
   // Agent loop — up to 8 iterations (handles multi-step tool use)
   for (let i = 0; i < 8; i++) {
-    const res = await fetch("https://api.deepseek.com/chat/completions", {
+    const res = await fetch(LLM_ENDPOINT, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
+        Authorization: `Bearer ${LLM_BACKEND === "ollama" ? "ollama" : key}`,
       },
       body: JSON.stringify({
         model: MODEL,
@@ -985,14 +1003,14 @@ async function runAgent(
 
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`DeepSeek ${res.status}: ${text}`);
+      throw new Error(`${LLM_BACKEND} ${res.status}: ${text}`);
     }
 
     const data = await res.json();
     const choice = data.choices?.[0];
     const msg = choice?.message;
 
-    if (!msg) throw new Error("Empty response from DeepSeek");
+    if (!msg) throw new Error(`Empty response from ${LLM_BACKEND}`);
 
     messages.push(msg);
 
