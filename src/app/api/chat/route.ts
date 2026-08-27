@@ -1017,7 +1017,14 @@ async function runAgent(
     ...prior,
   ];
 
-  const userContent = mapContext ? `${mapContext}\n\n${query}` : query;
+  // weatherContext (built client-side in ChatPanel/WeatherWidget) emits one line per
+  // weather station in the region — dozens of stations, up to the 4000-char cap on
+  // mapContext. On DeepSeek that's negligible; on CPU-only local inference it turned
+  // out to be the dominant cost, ballooning real prompts to 5000+ tokens versus the
+  // ~2000 tested in isolation (see qwen-local-llm-benchmark) and degrading answers.
+  const effectiveMapContext =
+    LLM_BACKEND === "ollama" && mapContext ? mapContext.replace(/\[Погода[^\]]*\]/, "").trim() || null : mapContext;
+  const userContent = effectiveMapContext ? `${effectiveMapContext}\n\n${query}` : query;
   messages.push({ role: "user", content: userContent });
 
   let accumulatedMapUpdate: Partial<MapState> | null = null;
