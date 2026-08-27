@@ -52,3 +52,4 @@ kazakhstan-260513-free/
 
 # terrain tiles (large binary, built once locally — see data/README if regenerating)
 /data/*.mbtiles
+._env.local
