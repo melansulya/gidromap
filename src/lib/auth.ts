@@ -2,6 +2,10 @@
 
 const ALG = { name: "HMAC", hash: "SHA-256" } as const;
 
+// Browsers refuse to store a Secure cookie over plain HTTP — set COOKIE_INSECURE=1
+// while running without a domain/TLS in front (e.g. testing by bare server IP).
+export const COOKIE_SECURE = process.env.NODE_ENV === "production" && process.env.COOKIE_INSECURE !== "1";
+
 // UTF-8 aware base64url (handles Cyrillic and other Unicode)
 function b64url(str: string): string {
   const bytes = new TextEncoder().encode(str);

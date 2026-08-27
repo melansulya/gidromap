@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { checkCredentials, signJWT } from "@/lib/auth";
+import { checkCredentials, signJWT, COOKIE_SECURE } from "@/lib/auth";
 import { verifyPassword } from "@/lib/password";
 import { getAdminClient } from "@/lib/supabaseServer";
 import { logActivity } from "@/lib/activityLog";
@@ -58,7 +58,7 @@ export async function POST(request: Request) {
     const res = NextResponse.json({ ok: true });
     res.cookies.set("auth_token", token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: COOKIE_SECURE,
       sameSite: "lax",
       path: "/",
       maxAge: 60 * 60 * 24 * 7,
@@ -95,7 +95,7 @@ export async function POST(request: Request) {
       const res = NextResponse.json({ ok: true });
       res.cookies.set("auth_token", token, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
+        secure: COOKIE_SECURE,
         sameSite: "lax",
         path: "/",
         maxAge: 60 * 60 * 24 * 7,

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { signJWT, verifyJWT } from "@/lib/auth";
+import { signJWT, verifyJWT, COOKIE_SECURE } from "@/lib/auth";
 import { verifyTotp } from "@/lib/totp";
 import { getAdminClient } from "@/lib/supabaseServer";
 import { logActivity } from "@/lib/activityLog";
@@ -71,7 +71,7 @@ export async function POST(request: Request) {
   const res = NextResponse.json({ ok: true });
   res.cookies.set("auth_token", token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: COOKIE_SECURE,
     sameSite: "lax",
     path: "/",
     maxAge: 60 * 60 * 24 * 7,
