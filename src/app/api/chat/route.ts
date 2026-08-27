@@ -961,6 +961,15 @@ type DeepSeekMessage = {
   tool_call_id?: string;
 };
 
+// Keeps the most recent messages, then drops any leading "tool" messages —
+// a tool result is only valid immediately after the assistant message that
+// requested it, so a slice can't safely start mid-tool-exchange.
+function trimPriorForLocalModel(prior: DeepSeekMessage[], maxMessages = 8): DeepSeekMessage[] {
+  let trimmed = prior.slice(-maxMessages);
+  while (trimmed.length > 0 && trimmed[0].role === "tool") trimmed = trimmed.slice(1);
+  return trimmed;
+}
+
 async function runAgent(
   query: string,
   sessionId: string,
@@ -970,7 +979,12 @@ async function runAgent(
   const key = process.env.DEEPSEEK_API_KEY;
   if (LLM_BACKEND === "deepseek" && !key) throw new Error("DEEPSEEK_API_KEY missing");
 
-  const prior = getSessionMessages(sessionId);
+  // Resending the full conversation history every turn is fine for DeepSeek's cloud
+  // inference, but on CPU-only local inference it makes context grow without bound —
+  // a single prior exchange pushed one real test from ~2100 to ~7000 prompt tokens,
+  // taking prompt processing from ~15s to ~100s+ and visibly degrading answer quality.
+  // Cap history to the last few messages for Ollama; DeepSeek keeps the full history.
+  const prior = LLM_BACKEND === "ollama" ? trimPriorForLocalModel(getSessionMessages(sessionId)) : getSessionMessages(sessionId);
 
   // The hydropost data dump is the single biggest cost on CPU-only local inference
   // (see qwen-local-llm-benchmark) — only DeepSeek's cloud inference can afford it
