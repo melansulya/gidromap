@@ -2,10 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   getHydropostHistory,
-  hydroposts,
+  hydroposts as allHydroposts,
   pickLocalResult,
   type Hydropost,
 } from "@/lib/akmolaMapData";
+import type { Region } from "@/lib/types";
+
+function regionalHydroposts(region: Region): Hydropost[] {
+  return allHydroposts.filter((post) => post.region === region);
+}
 
 export type QueryMechanism =
   | "reference"
@@ -231,16 +236,16 @@ function scoreHydropost(post: Hydropost, query: string) {
   return score;
 }
 
-function resolveBestMatch(query: string) {
-  const ranked = hydroposts
+function resolveBestMatch(query: string, region: Region) {
+  const ranked = regionalHydroposts(region)
     .map((post) => ({ post, score: scoreHydropost(post, query) }))
     .sort((left, right) => right.score - left.score || right.post.waterLevel - left.post.waterLevel);
 
-  return ranked[0]?.score ? ranked[0].post : pickLocalResult(query).bestMatch;
+  return ranked[0]?.score ? ranked[0].post : pickLocalResult(query, region).bestMatch;
 }
 
-function handleReference(query: string): MechanismResult {
-  const bestMatch = resolveBestMatch(query);
+function handleReference(query: string, region: Region): MechanismResult {
+  const bestMatch = resolveBestMatch(query, region);
   const history = getHydropostHistory(bestMatch.code);
 
   return {
@@ -261,8 +266,8 @@ function handleReference(query: string): MechanismResult {
   };
 }
 
-function handleOperational(query: string): MechanismResult {
-  const fallback = pickLocalResult(query);
+function handleOperational(query: string, region: Region): MechanismResult {
+  const fallback = pickLocalResult(query, region);
   return {
     mechanism: "operational",
     operation: "operational_filter_posts",
@@ -272,15 +277,15 @@ function handleOperational(query: string): MechanismResult {
   };
 }
 
-function handleOperationalCountByDistrict(query: string): MechanismResult {
+function handleOperationalCountByDistrict(query: string, region: Region): MechanismResult {
   const text = normalize(query);
-  const districtMatches = hydroposts.filter(
+  const districtMatches = regionalHydroposts(region).filter(
     (post) =>
       text.includes(post.district.toLowerCase()) ||
       post.topics.some((topic) => text.includes(topic.toLowerCase())),
   );
-  const markers = districtMatches.length > 0 ? districtMatches : pickLocalResult(query).markers;
-  const bestMatch = markers[0] ?? pickLocalResult(query).bestMatch;
+  const markers = districtMatches.length > 0 ? districtMatches : pickLocalResult(query, region).markers;
+  const bestMatch = markers[0] ?? pickLocalResult(query, region).bestMatch;
 
   return {
     mechanism: "operational",
@@ -294,15 +299,15 @@ function handleOperationalCountByDistrict(query: string): MechanismResult {
   };
 }
 
-function handleOperationalCountByRiver(query: string): MechanismResult {
+function handleOperationalCountByRiver(query: string, region: Region): MechanismResult {
   const text = normalize(query);
-  const riverMatches = hydroposts.filter(
+  const riverMatches = regionalHydroposts(region).filter(
     (post) =>
       text.includes(post.waterBody.toLowerCase()) ||
       post.topics.some((topic) => text.includes(topic.toLowerCase())),
   );
-  const markers = riverMatches.length > 0 ? riverMatches : pickLocalResult(query).markers;
-  const bestMatch = markers[0] ?? pickLocalResult(query).bestMatch;
+  const markers = riverMatches.length > 0 ? riverMatches : pickLocalResult(query, region).markers;
+  const bestMatch = markers[0] ?? pickLocalResult(query, region).bestMatch;
 
   return {
     mechanism: "operational",
@@ -316,14 +321,15 @@ function handleOperationalCountByRiver(query: string): MechanismResult {
   };
 }
 
-function handleOperationalExtremes(query: string): MechanismResult {
+function handleOperationalExtremes(query: string, region: Region): MechanismResult {
   const text = normalize(query);
   const wantMin = matchesAny(text, ["минимальный уровень", "самый низкий", "минимум"]);
   const wantDanger = matchesAny(text, ["опасн", "критичн", "плохой", "хуже"]);
 
-  let pool = [...hydroposts];
+  const regionPosts = regionalHydroposts(region);
+  let pool = [...regionPosts];
   if (wantDanger) pool = pool.filter((p) => p.status === "danger");
-  if (pool.length === 0) pool = [...hydroposts];
+  if (pool.length === 0) pool = [...regionPosts];
 
   const sorted = pool.sort((a, b) =>
     wantMin ? a.waterLevel - b.waterLevel : b.waterLevel - a.waterLevel,
@@ -346,8 +352,8 @@ function handleOperationalExtremes(query: string): MechanismResult {
   };
 }
 
-function handleHistorical(query: string): MechanismResult {
-  const bestMatch = resolveBestMatch(query);
+function handleHistorical(query: string, region: Region): MechanismResult {
+  const bestMatch = resolveBestMatch(query, region);
   const history = getHydropostHistory(bestMatch.code);
 
   if (!history || history.history.length === 0) {
@@ -378,9 +384,9 @@ function handleHistorical(query: string): MechanismResult {
   };
 }
 
-function handleHistoricalMissing(query: string): MechanismResult {
-  const markers = hydroposts.filter((post) => !getHydropostHistory(post.code));
-  const bestMatch = markers[0] ?? resolveBestMatch(query);
+function handleHistoricalMissing(query: string, region: Region): MechanismResult {
+  const markers = regionalHydroposts(region).filter((post) => !getHydropostHistory(post.code));
+  const bestMatch = markers[0] ?? resolveBestMatch(query, region);
 
   return {
     mechanism: "historical",
@@ -460,17 +466,18 @@ type RiverGroup = {
   }>;
 };
 
-let cachedServerWaterways: ServerWaterway[] | null = null;
+const cachedServerWaterways = new Map<Region, ServerWaterway[]>();
 
-function loadServerWaterways(): ServerWaterway[] {
-  if (cachedServerWaterways) {
-    return cachedServerWaterways;
+function loadServerWaterways(region: Region): ServerWaterway[] {
+  const cached = cachedServerWaterways.get(region);
+  if (cached) {
+    return cached;
   }
 
-  const filePath = path.join(process.cwd(), "public", "akmola-waterways.json");
+  const filePath = path.join(process.cwd(), "public", `${region}-waterways.json`);
   const raw = fs.readFileSync(filePath, "utf-8");
   const parsed = JSON.parse(raw) as ServerWaterway[];
-  cachedServerWaterways = parsed;
+  cachedServerWaterways.set(region, parsed);
   return parsed;
 }
 
@@ -496,10 +503,10 @@ function isGenericWaterwayName(name: string) {
   return ["river", "stream", "ditch", "drain", "canal"].includes(name.toLowerCase().trim());
 }
 
-function getRiverGroups(): RiverGroup[] {
+function getRiverGroups(region: Region): RiverGroup[] {
   const grouped = new Map<string, RiverGroup>();
 
-  for (const object of loadServerWaterways()) {
+  for (const object of loadServerWaterways(region)) {
     if (object.kind !== "river" || object.geometry !== "polyline") {
       continue;
     }
@@ -777,9 +784,11 @@ function buildSuggestedPlacementsForSegments(
   return placements;
 }
 
-function handleNearestHydropostDistance(): MechanismResult {
-  if (hydroposts.length < 2) {
-    const fallbackPost = hydroposts[0] ?? pickLocalResult("гидропосты").bestMatch;
+function handleNearestHydropostDistance(region: Region): MechanismResult {
+  const posts = regionalHydroposts(region);
+
+  if (posts.length < 2) {
+    const fallbackPost = posts[0] ?? pickLocalResult("гидропосты", region).bestMatch;
     return {
       mechanism: "spatial",
       operation: "spatial_nearest_posts",
@@ -796,10 +805,10 @@ function handleNearestHydropostDistance(): MechanismResult {
   let nearestPair: [Hydropost, Hydropost] | null = null;
   let nearestDistanceKm = Number.POSITIVE_INFINITY;
 
-  for (let leftIndex = 0; leftIndex < hydroposts.length; leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < hydroposts.length; rightIndex += 1) {
-      const left = hydroposts[leftIndex];
-      const right = hydroposts[rightIndex];
+  for (let leftIndex = 0; leftIndex < posts.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < posts.length; rightIndex += 1) {
+      const left = posts[leftIndex];
+      const right = posts[rightIndex];
       const distanceBetweenPosts = distanceKm(left.coordinates, right.coordinates);
 
       if (distanceBetweenPosts < nearestDistanceKm) {
@@ -809,7 +818,7 @@ function handleNearestHydropostDistance(): MechanismResult {
     }
   }
 
-  const bestMatch = nearestPair?.[0] ?? hydroposts[0];
+  const bestMatch = nearestPair?.[0] ?? posts[0];
   const markers = nearestPair ? [nearestPair[0], nearestPair[1]] : [bestMatch];
   const pairLabel = nearestPair
     ? `${nearestPair[0].label} и ${nearestPair[1].label}`
@@ -832,7 +841,12 @@ function handleNearestHydropostDistance(): MechanismResult {
   };
 }
 
-function handleSpatial(query: string): MechanismResult {
+const REGION_LABEL: Record<Region, string> = {
+  akmola: "Акмолинской области",
+  kyzylorda: "Кызылординской области",
+};
+
+function handleSpatial(query: string, region: Region): MechanismResult {
   const normalizedQuery = normalize(query);
 
   if (
@@ -843,12 +857,12 @@ function handleSpatial(query: string): MechanismResult {
       normalizedQuery.includes(token),
     )
   ) {
-    return handleNearestHydropostDistance();
+    return handleNearestHydropostDistance(region);
   }
 
   const mainRiverPreference = resolveMainRiverPreference(query);
   if (mainRiverPreference === null) {
-    const fallback = pickLocalResult(query);
+    const fallback = pickLocalResult(query, region);
     return {
       mechanism: "spatial",
       operation: "spatial_spacing_coverage",
@@ -869,12 +883,12 @@ function handleSpatial(query: string): MechanismResult {
 
   const spacingMatch = normalizedQuery.match(/(\d+)\s*км/);
   const spacingKm = spacingMatch ? Number(spacingMatch[1]) : 10;
-  const existingRiverPosts = hydroposts.filter(
+  const existingRiverPosts = regionalHydroposts(region).filter(
     (post) =>
       post.waterBody.toLowerCase().includes("р.") ||
       post.waterBody.toLowerCase().includes("река"),
   );
-  const riverGroups = getRiverGroups().filter((group) =>
+  const riverGroups = getRiverGroups(region).filter((group) =>
     mainRiverPreference ? isMainRiver(group) : true,
   );
   const groupsByKey = new Map(riverGroups.map((group) => [group.key, group]));
@@ -959,13 +973,13 @@ function handleSpatial(query: string): MechanismResult {
   const suggestedPlacements = highlightedCoverage.flatMap((river) => river.suggestedPlacements).slice(0, 24);
   const bestMatch =
     [...existingRiverPosts].sort((left, right) => right.waterLevel - left.waterLevel)[0] ??
-    hydroposts[0];
+    regionalHydroposts(region)[0];
 
   return {
     mechanism: "spatial",
     operation: "spatial_spacing_coverage",
     answer: [
-      `По текущему речному слою Акмолинской области суммарная длина русел составляет примерно ${Math.round(totalRiverKm)} км.`,
+      `По текущему речному слою ${REGION_LABEL[region]} суммарная длина русел составляет примерно ${Math.round(totalRiverKm)} км.`,
       mainRiverPreference
         ? "Расчёт выполнен только по основным рекам."
         : "Расчёт выполнен по всей доступной именованной речной сети.",
@@ -986,29 +1000,29 @@ function handleSpatial(query: string): MechanismResult {
   };
 }
 
-export function runLocalMechanism(query: string): MechanismResult | null {
+export function runLocalMechanism(query: string, region: Region = "akmola"): MechanismResult | null {
   const mechanism = classifyQuery(query);
   const operation = resolveOperation(query, mechanism);
 
   switch (operation) {
     case "reference_post_info":
-      return handleReference(query);
+      return handleReference(query, region);
     case "operational_filter_posts":
-      return handleOperational(query);
+      return handleOperational(query, region);
     case "operational_count_posts_by_district":
-      return handleOperationalCountByDistrict(query);
+      return handleOperationalCountByDistrict(query, region);
     case "operational_count_posts_by_river":
-      return handleOperationalCountByRiver(query);
+      return handleOperationalCountByRiver(query, region);
     case "operational_extreme_levels":
-      return handleOperationalExtremes(query);
+      return handleOperationalExtremes(query, region);
     case "historical_summary":
-      return handleHistorical(query);
+      return handleHistorical(query, region);
     case "historical_missing":
-      return handleHistoricalMissing(query);
+      return handleHistoricalMissing(query, region);
     case "spatial_nearest_posts":
-      return handleNearestHydropostDistance();
+      return handleNearestHydropostDistance(region);
     case "spatial_spacing_coverage":
-      return handleSpatial(query);
+      return handleSpatial(query, region);
     default:
       return null;
   }

@@ -1,0 +1,85 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+AI Gidromap — an interactive Next.js map for monitoring hydroposts (water-level gauges), currently covering the Akmola and Kyzylorda regions of Kazakhstan (see "Regions and the entry-point overview map" below). A MapLibre map of rivers/lakes/hydroposts/settlements/districts is driven both by direct UI interaction and by a DeepSeek-powered chat agent that can query data and mutate map state (highlight rivers, filter posts, suggest new post placements, etc.).
+
+## Commands
+
+```bash
+npm run dev      # start dev server (Next.js 16 + Turbopack, default for `next dev`)
+npm run build    # production build
+npm run start    # run production build
+npm run lint     # eslint (eslint-config-next core-web-vitals + typescript)
+```
+
+There is no test suite configured in this repo.
+
+Node script `scripts/fetch-districts.js` regenerates `public/akmola-districts.geojson` from an external source — not part of the normal dev loop.
+
+## Environment variables
+
+Required/used across the app (see `.env.local`, gitignored):
+
+- `AUTH_SECRET` — HMAC secret for the custom JWT (edge-compatible, `src/lib/auth.ts`)
+- `AUTH_USERS` — JSON array of bootstrap admin users `{email,password,name,role}`, checked before the Supabase `users` table
+- `NEXT_PUBLIC_SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` — Supabase admin client (`src/lib/supabaseServer.ts`); service-role key bypasses RLS and must never reach the client
+- `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL` (optional, defaults to `deepseek-chat`) — chat agent backend
+- `OPENAI_API_KEY` — used only for `/api/speak` (TTS) and `/api/transcribe` (STT)
+- `COPERNICUS_CLIENT_ID`, `COPERNICUS_CLIENT_SECRET` — Copernicus Data Space OAuth client for on-demand Sentinel-2 satellite imagery (`src/lib/sentinelHub.ts`)
+
+## Architecture
+
+### Auth (custom, not NextAuth)
+
+- `src/lib/auth.ts` implements JWT sign/verify with the Web Crypto API directly (edge-compatible, no `jsonwebtoken` dependency). Two user sources are checked in order at login (`src/app/api/auth/login/route.ts`): (1) env-configured `AUTH_USERS` bootstrap accounts, (2) a Supabase `users` table (schema in `supabase/users.sql`) with bcrypt password hashes and optional TOTP 2FA (`src/lib/totp.ts`, `src/app/api/auth/2fa/*`, `src/app/api/auth/login/2fa/`).
+- `src/middleware.ts` gates every route except `/login`, `/api/auth/*`, and Next internals; it checks the `auth_token` cookie and redirects to `/login` if missing/invalid, and additionally restricts `/admin` to `role === "admin"`.
+- Roles: `admin`, `akim`, `deputy`. Admin gets `/admin` (user management + activity stats); all authenticated roles get `/` (map) and `/dashboard` (region-wide summary: status counts, low-water risk, weather/snowmelt, historical peak levels — computed client-side from the same `akmolaMapData.ts` helpers as the map, not a separate backend).
+- Login/rate-limiting (`isLoginLocked`) and chat rate-limiting (`isRateLimited` in the chat route) are in-memory `Map`s — best-effort, reset per serverless instance, not a hard guarantee.
+
+### Regions and the entry-point overview map
+
+The app is multi-region (`Region = "akmola" | "kyzylorda"` in `src/lib/types.ts`; `Hydropost.region` in `akmolaMapData.ts` tags each of the 41 hardcoded posts). `src/app/page.tsx` holds `selectedRegion: Region | null`, defaulting to `null` on every load/refresh (not persisted) — `null` renders `src/components/KazakhstanOverview.tsx`, a lightweight standalone MapLibre map (all 20 Kazakhstan oblasts + 2 cities of republican significance from `public/kazakhstan-oblasts.geojson`, fetched via Overpass) with no relation to `AkmolaMap.tsx`. Clicking an oblast whose `name:ru` is in `OBLAST_TO_REGION` calls `onSelectRegion`; any other oblast shows a transient "данные скоро появятся" notice instead of navigating. Once `selectedRegion` is set, `page.tsx` swaps to the full map+chat layout (`AkmolaMap` mounted with `key={selectedRegion}` — a real unmount/remount, not a live in-place region switch) with a "← Казахстан" button that sets `selectedRegion` back to `null`. Per-region data files in `public/` follow an `{region}-*.json`/`.geojson` naming convention (`akmola-water-bodies.json`, `kyzylorda-water-bodies.json`, etc.) that `AkmolaMap.tsx`'s fetchers, the chat route, and `aiMechanisms.ts` all key off of via a `region` parameter — adding a third region means adding its data files under that convention, an entry in `REGION_VIEW`/`REGION_META`-style lookups in each of those files, and an `OBLAST_TO_REGION` entry in `KazakhstanOverview.tsx`. Kyzylorda's 13 hydroposts currently have no historical time series and a placeholder `waterLevel: 0` — `Hydropost.hasLevelData: boolean` marks this explicitly so the UI (`PostDetailPanel.tsx`, marker popups, the dashboard's status-count card) shows "Нет данных" instead of a fabricated reading; the chat system prompt separately warns the LLM not to present it as real.
+
+### Map state — single source of truth
+
+`src/app/page.tsx` owns one `MapState` object (`src/lib/types.ts`) covering active/highlighted hydroposts, highlighted water objects/places/districts, suggested new-post placements, active layer, and visibility toggles, scoped to whichever region is currently selected. Both direct map interaction (`AkmolaMap.tsx` callbacks) and the chat agent (`ChatPanel.tsx` → `onMapUpdate`) mutate this same state via `updateMap` — there is no separate state store for chat-driven vs. manual map changes.
+
+### Map rendering (`src/components/AkmolaMap.tsx`, ~1400 lines)
+
+MapLibre GL with three swappable base styles (`dark`/`bright` from self-hosted OpenFreeMap tiles, `imagery` from Esri World Imagery raster). Data layers are static JSON/GeoJSON fetched from `public/` and cached at module scope (`waterCache`, `placesCache`, `districtsCache`, etc.) — fetched once per browser session, not per-render. Includes client-side distance measurement and water-network tracing (`src/lib/measure.ts`, builds a graph over water polylines with `buildGraph`/`measureWaterPath`). 3D building extrusion reads OpenMapTiles' vector schema (`source: "openmaptiles"`, `render_height`/`render_min_height` properties) — these are OpenFreeMap/OpenMapTiles field names, not Mapbox's (`height`/`min_height`/`extrude`), which only exist on Mapbox-hosted styles.
+
+### Hydropost data (`src/lib/akmolaMapData.ts`, ~800 lines)
+
+Hardcoded array of 28 hydroposts (from source XLSX files at repo root, not read at runtime) with per-post historical time series — coverage varies by post, from a few years up to 1974–2022 for the Nura basin posts — and helpers: `getHydropostHistory`, `analyzeLowWaterRisk` (median-based low-water risk classification), `pickLocalResult` (keyword-based fallback matcher used by both `aiMechanisms.ts` and the chat tool executor). When adding history for a new post from a raw Kazgidromet-style xlsx (форма 102а), match the existing `HydropostHistoryEntry` shape exactly — `stats` fields are precomputed (min/max over `history`), not derived at read time.
+
+### Two parallel "local" query engines
+
+`{region}-water-bodies.json`'s `kind` field (`"river" | "lake" | "reservoir"`) drives water-layer line/fill color in `AkmolaMap.tsx` and the "🏞 Река"/"💧 Озеро" popup label — it does **not** feed `aiMechanisms.ts`'s river-coverage analysis (that reads only `{region}-waterways.json` polylines, a separate file, always correctly classified). Kyzylorda's original fetch classified only `waterway=riverbank`-tagged ways as `"river"`, silently defaulting the modern `natural=water`+`water=river` tagging (which is how essentially all of the Syrdarya's width polygon is actually tagged in OSM there) to `"lake"` — 189 polygons were mislabeled until a by-OSM-ID reclassification pass fixed it. Akmola's original fetch already checked both tag conventions and needed no fix. If re-deriving either region's water-bodies file from scratch, classify `kind: "river"` when `waterway === "riverbank"` **or** `water === "river"` — missing the latter is exactly this bug.
+
+There are two independent non-LLM query mechanisms that both operate on the same hydropost/water data — don't confuse them:
+
+1. **`src/lib/aiMechanisms.ts`** — a rule-based query classifier (`classifyQuery`/`resolveOperation`) that pattern-matches Russian query text into operations (reference/operational/historical/spatial) without calling any LLM. Includes real geometric spatial analysis: projecting hydroposts onto river polylines, computing coverage gaps, and suggesting new post placements along rivers by chainage. Its `runLocalMechanism` is invoked from the chat route's `get_spatial_coverage` tool.
+2. **`src/app/api/chat/route.ts`** — the DeepSeek tool-calling agent. It defines its own `TOOLS` (function-calling schema) with executors (`execFilterHydroposts`, `execHighlightWater`, etc.) that produce `{ data, mapUpdate }`. Sessions are kept in an in-memory `Map` keyed by `chatId`/`sessionId` with a 30-min TTL and message-count cap — also reset per serverless instance. The system prompt hardcodes rules such as: never reveal the underlying model, highlight color is fixed cyan, and never assert upstream/downstream causality between posts since that relationship isn't in the data.
+
+### Other integrations
+
+- `src/lib/terrainTiles.ts` serves self-hosted 3D terrain tiles from a local `.mbtiles` SQLite file **per region** (`data/{region}-terrain.mbtiles`, gitignored, not regenerated at runtime) through `src/app/api/terrain/[z]/[x]/[y]/route.ts?region=`. Regenerated offline from a Copernicus DEM GeoTIFF (OpenTopography `globaldem` API, `demtype=COP90`) via `rio rgbify -b -10000 -i 0.1 --min-z 5 --max-z N`: feed it the raw EPSG:4326 GeoTIFF directly — pre-reprojecting to EPSG:3857 breaks rio-rgbify's own bounds transform (`densify_pts` GDAL error). The two regions' pyramids are NOT built to the same max zoom — Akmola is `akmola-terrain.mbtiles` (~220MB, z5–11); Kyzylorda's oblast is larger in area, so its pyramid was deliberately cut to z5–9 (`kyzylorda-terrain.mbtiles`, ~46MB) to keep the file small, per an explicit user ask to go easy on disk/memory — a full z11 pyramid at COP90 for that area would have been considerably bigger than Akmola's. Each region's actual min/max zoom is declared in **`TERRAIN_ZOOM`/`RELIEF_ZOOM`** in `AkmolaMap.tsx` (and mirrored in the three API routes) — must match what was actually built or MapLibre either 404s below minzoom or fails to overzoom past maxzoom. Adding a third region's terrain means: fetch its DEM (OpenTopography `globaldem`, `demtype=COP90` is the size/quality tradeoff used so far), run `rio rgbify` into `data/{region}-terrain.mbtiles`, and add entries to `TERRAIN_ZOOM` and `MBTILES_PATH` (`terrainTiles.ts`).
+- `src/lib/elevationColor.ts` + `src/app/api/relief/[z]/[x]/[y]/route.ts` + `src/app/api/relief/stats/route.ts` implement the hypsometric-tint (color-by-elevation) layer — colorized **on the fly, per request**, straight from the region's terrain mbtiles (no separate pre-baked tile set), region selected via `?region=` on both endpoints. The tile route takes `?min=&max=` and maps elevation to color via `RELATIVE_STOPS` (fractions 0-1, not absolute elevation) scaled to that range, falling back to a per-region `DEFAULT_RANGE` (real min/max differs a lot: Akmola ~46–923m, Kyzylorda ~20–1410m across the fetched bbox, mean ~140m — it's mostly flat steppe near the Syrdarya/Aral Sea with a sliver of higher ground at the Karatau-side edge) when the client hasn't resolved a viewport range yet; `/stats?region=&bbox=&zoom=` decodes whatever terrain tiles intersect a viewport and returns the real min/max there, clamped to that region's `RELIEF_ZOOM`. `AkmolaMap.tsx` calls `/stats` on `moveend` (debounced) and re-points the source with `RasterTileSource.setTiles()` — so the tint rescales to whatever's currently on screen (mirrors `RELIEF_RELATIVE_STOPS`/legend client-side, matching `RELATIVE_STOPS` server-side; keep both in sync). Not MapLibre's native `color-relief` layer, which needs v6 (see below), and not `gdaldem color-relief`/`gdal2tiles.py` (no GDAL CLI in this environment, only the `rasterio`/`sharp` packages). **Decoding a terrain tile is expensive enough that doing it uncached pushed the Turbopack dev server over its memory threshold and force-restarted it mid-session** — `decodeElevationTileCached()` (bounded 60-entry insertion-order cache, shared by both routes since `/stats` and the tile route often decode the same tiles seconds apart) fixed it; **the cache key is prefixed with the region** (`${region}/${zoom}/${x}/${y}`) since both regions' tile pyramids reuse the same z/x/y coordinates at low zoom — don't drop that prefix or the two regions' tiles will collide in the cache. 3D building extrusion (`setup3DBuildings`, always on regardless of region or the "3D" toggle) is unrelated to any of this — it comes from the base OpenFreeMap vector tiles' own `building` layer, not from these per-region DEM files, which is why buildings render in 3D even where no terrain mbtiles exists yet.
+- **MapLibre is pinned to v5** (`^5.24.0`) — do not upgrade to v6 casually. v6 requires real code changes (namespace import instead of default import, an explicit `setWorkerUrl()` call for bundlers) that were made and got the app running with zero console errors, but the map canvas rendered completely black in headless-browser testing here. Unclear if it's a real v6 regression or an artifact of software-rendered WebGL2 in that headless environment — not confirmed to fail in a real GPU browser, but not confirmed to work either. If retrying, verify with an actual screenshot (not just "no console errors"), not just `tsc`.
+- `src/lib/sentinelHub.ts` fetches on-demand Sentinel-2 true-color imagery from Copernicus Data Space (OAuth client-credentials flow, cached token) via `src/lib/satelliteCache.ts` and `src/app/api/satellite/*`.
+- `src/app/api/weather/route.ts` — Open-Meteo weather data, consumed by both `WeatherWidget.tsx` and folded into the chat agent's context for flood-risk reasoning (heavy precipitation / snowmelt heuristics live in the chat system prompt, not in code).
+- `src/lib/waterPassport.ts` — static reference data (length, source, mouth, tributaries) for named rivers/lakes, shown in `WaterObjectPanel.tsx`.
+- `public/{region}-river-widths.json` — river-width reaches from GRWL (Global River Widths from Landsat; Allen & Pavelsky 2018, CC-BY 4.0), used by the chat tool `get_river_widths` (`src/app/api/chat/route.ts`) to answer "which rivers are at least N meters wide" queries. Extracted **once, offline**, the same "static download → own file, no live foreign call at runtime" pattern as the terrain DEM data: the global `GRWL_summaryStats` shapefile (~43MB, Zenodo) was downloaded, filtered to segments whose vertices fall inside each region's oblast polygon, and matched to the nearest named waterway in `{region}-waterways.json` (within 3km; `name: null` when nothing matched) — not regenerated at runtime. GRWL only reliably resolves rivers roughly ≥30m wide, measured in discontinuous reaches rather than whole rivers (e.g. Сырдарья shows up as 8 separate reaches with different widths) — the chat system prompt is told explicitly that a river's absence from this data means "not measured," not "narrow," so it doesn't overclaim. Do not fetch GRWL via Google Earth Engine as a live API — that would reintroduce a live foreign dependency defeating the point of doing this offline; use the static Zenodo file only.
+- `src/lib/activityLog.ts` / `src/lib/track.ts` — best-effort audit logging to Supabase (`activity_log` table), fire-and-forget from the client via `/api/activity`, surfaced in `/admin`.
+- `next.config.ts` sets a strict CSP allow-listing exactly the external hosts this app calls (OpenFreeMap tiles, Supabase, Open-Meteo, Esri). Adding a new external API requires updating `connect-src` here.
+
+## Data files
+
+Root-level `.xlsx` files are the original source data hydropost figures were transcribed from — not read by the app at runtime. `public/*.json`/`*.geojson` are the runtime data (water bodies, waterways, places, districts, border) fetched client-side and also read server-side via `fs.readFileSync(path.join(process.cwd(), "public", ...))` in API routes (chat tools, spatial mechanism).
+
+## Architecture roadmap
+
+See [docs/superpowers/specs/2026-08-12-scaling-architecture-roadmap-design.md](docs/superpowers/specs/2026-08-12-scaling-architecture-roadmap-design.md) for the full scaling plan: multi-tenancy model, moving hydropost data off the hardcoded array into a real schema, localizing the AI agent (compliance-driven — chat data currently leaves the country via DeepSeek/OpenAI), and supporting SaaS and self-hosted deployment from one codebase. Current phase: **Phase 0** (pre-first-client) — Postgres-backed multi-tenant schema + moving chat sessions/rate-limiting off in-memory `Map`s, in parallel with standing up a Kazakhstan-hosted LLM to replace DeepSeek.

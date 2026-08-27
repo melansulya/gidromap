@@ -45,6 +45,7 @@ const ACTION_LABELS: Record<string, string> = {
   measure_distance: "Измерение линейкой",
   water_trace: "Водный след",
   export_doc: "Экспорт файла",
+  switch_region: "Смена региона",
 };
 
 function fmtDate(iso: string) {
@@ -63,6 +64,7 @@ function summarizeDetails(row: ActivityRow): string {
       : `${d.labelA ?? "?"} → ${d.labelB ?? "?"} — нет соединения`;
   }
   if (row.action === "export_doc") return `.${d.format ?? "?"} (${d.scope === "chat" ? "весь диалог" : "ответ ИИ"})`;
+  if (row.action === "switch_region") return d.region === "kyzylorda" ? "Кызылординская область" : "Акмолинская область";
   return "";
 }
 
@@ -76,6 +78,7 @@ export default function AdminPage() {
   const [name, setName]         = useState("");
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [role, setRole]         = useState<"akim" | "deputy">("deputy");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError]   = useState("");
@@ -207,15 +210,38 @@ export default function AdminPage() {
                 <div style={s.row}>
                   <div style={s.field}>
                     <label style={s.label}>Пароль</label>
-                    <input
-                      type="text"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      placeholder="Минимум 6 символов"
-                      required
-                      minLength={6}
-                      style={s.input}
-                    />
+                    <div style={s.passwordWrap}>
+                      <input
+                        type={showPassword ? "text" : "password"}
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="Минимум 6 символов"
+                        required
+                        minLength={6}
+                        style={s.passwordInput}
+                        autoComplete="new-password"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword((v) => !v)}
+                        style={s.eyeBtn}
+                        tabIndex={-1}
+                        aria-label={showPassword ? "Скрыть пароль" : "Показать пароль"}
+                      >
+                        {showPassword ? (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+                            <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                            <line x1="1" y1="1" x2="23" y2="23" />
+                          </svg>
+                        ) : (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                            <circle cx="12" cy="12" r="3" />
+                          </svg>
+                        )}
+                      </button>
+                    </div>
                   </div>
                   <div style={s.field}>
                     <label style={s.label}>Роль</label>
@@ -455,6 +481,9 @@ const s = {
   field: { flex: "1 1 200px", display: "flex", flexDirection: "column" as const, gap: 5 },
   label: { fontSize: 12, color: "#8b949e", fontWeight: 500 },
   input: { background: "#0d1117", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "#e6edf3", fontSize: 13, padding: "8px 12px", outline: "none", fontFamily: "inherit", width: "100%", boxSizing: "border-box" as const },
+  passwordWrap: { position: "relative" as const, width: "100%" },
+  passwordInput: { background: "#0d1117", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "#e6edf3", fontSize: 13, padding: "8px 40px 8px 12px", outline: "none", fontFamily: "inherit", width: "100%", boxSizing: "border-box" as const },
+  eyeBtn: { position: "absolute" as const, right: 10, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "#6e7681", cursor: "pointer", padding: 2, display: "flex", alignItems: "center", justifyContent: "center" },
   error:   { fontSize: 12, color: "#ef4444", padding: "6px 10px", background: "#ef444410", border: "1px solid #ef444430", borderRadius: 6 },
   success: { fontSize: 12, color: "#22c55e", padding: "6px 10px", background: "#22c55e10", border: "1px solid #22c55e30", borderRadius: 6 },
   btn: { alignSelf: "flex-start" as const, background: "#1f6feb", border: "none", borderRadius: 8, color: "#fff", fontSize: 13, fontWeight: 600, padding: "9px 20px", cursor: "pointer", fontFamily: "inherit" },

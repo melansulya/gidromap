@@ -7,7 +7,7 @@ const csp = [
   "style-src 'self' 'unsafe-inline'",
   "font-src 'self' data:",
   "worker-src 'self' blob:",
-  "connect-src 'self' https://api.mapbox.com https://events.mapbox.com https://*.supabase.co https://api.open-meteo.com",
+  "connect-src 'self' https://tiles.openfreemap.org https://*.supabase.co https://api.open-meteo.com https://services.arcgisonline.com",
   "frame-ancestors 'none'",
 ].join("; ");
 

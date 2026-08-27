@@ -49,21 +49,27 @@ export function PostDetailPanel({ postCode, onClose }: Props) {
       {tab === "monitor" && (
         <>
           <Section title="Текущий уровень">
-            <div style={s.levelRow}>
-              <span style={{ ...s.badge, background: sc.bg, color: sc.color, border: `1px solid ${sc.border}` }}>
-                {sc.label}
-              </span>
-              <span style={{ color: sc.color, fontSize: 24, fontWeight: 800, lineHeight: 1 }}>
-                {post.waterLevel}
-                <span style={{ fontSize: 11, color: "#8b949e", marginLeft: 3, fontWeight: 400 }}>см</span>
-              </span>
-            </div>
-            <GaugeBar level={post.waterLevel} status={post.status} />
-            <div style={s.gaugeLabels}>
-              <span>0</span>
-              <span style={{ color: "#f59e0b" }}>порог</span>
-              <span style={{ color: "#ef4444" }}>опасно</span>
-            </div>
+            {post.hasLevelData ? (
+              <>
+                <div style={s.levelRow}>
+                  <span style={{ ...s.badge, background: sc.bg, color: sc.color, border: `1px solid ${sc.border}` }}>
+                    {sc.label}
+                  </span>
+                  <span style={{ color: sc.color, fontSize: 24, fontWeight: 800, lineHeight: 1 }}>
+                    {post.waterLevel}
+                    <span style={{ fontSize: 11, color: "#8b949e", marginLeft: 3, fontWeight: 400 }}>см</span>
+                  </span>
+                </div>
+                <GaugeBar level={post.waterLevel} status={post.status} />
+                <div style={s.gaugeLabels}>
+                  <span>0</span>
+                  <span style={{ color: "#f59e0b" }}>порог</span>
+                  <span style={{ color: "#ef4444" }}>опасно</span>
+                </div>
+              </>
+            ) : (
+              <div style={s.noData}>Нет данных</div>
+            )}
           </Section>
 
           {validRows.length > 0 && (
@@ -248,9 +254,11 @@ function LowWaterChart({ entries }: { entries: LowWaterRiskEntry[] }) {
           <g key={e.year}>
             <rect x={cx} y={yTop} width={bW} height={barH}
               fill={RISK_COLOR[e.risk]} fillOpacity={0.75} rx={2} />
-            <text x={cx + bW / 2} y={H - 4} textAnchor="middle" fontSize={9} fill="#6e7681">
-              {String(e.year).slice(2)}
-            </text>
+            {shouldLabel(i, entries.length) && (
+              <text x={cx + bW / 2} y={H - 4} textAnchor="middle" fontSize={9} fill="#6e7681">
+                {String(e.year).slice(2)}
+              </text>
+            )}
           </g>
         );
       })}
@@ -311,6 +319,14 @@ function GaugeBar({ level, status }: { level: number; status: "normal" | "warnin
   );
 }
 
+// With long histories (40+ years) a label per bar overlaps into an unreadable
+// smear, so only show enough labels to stay legible (always including the last
+// year), spaced evenly.
+function shouldLabel(i: number, count: number, maxLabels = 12): boolean {
+  const step = Math.max(1, Math.ceil(count / maxLabels));
+  return i % step === 0 || i === count - 1;
+}
+
 /* ── Bar chart ────────────────────────────────────────────────────────────── */
 
 function BarChart({ rows }: { rows: HydropostHistoryEntry[] }) {
@@ -358,9 +374,11 @@ function BarChart({ rows }: { rows: HydropostHistoryEntry[] }) {
             {h.highestYearCm != null && (
               <rect x={x + b1W + 2} y={PT + cH - pkH} width={b2W} height={pkH} fill="#f59e0b" fillOpacity={0.75} rx={1} />
             )}
-            <text x={x + slotW / 2 - 1} y={H - 5} textAnchor="middle" fontSize={9} fill="#6e7681">
-              {String(h.year).slice(2)}
-            </text>
+            {shouldLabel(i, rows.length) && (
+              <text x={x + slotW / 2 - 1} y={H - 5} textAnchor="middle" fontSize={9} fill="#6e7681">
+                {String(h.year).slice(2)}
+              </text>
+            )}
           </g>
         );
       })}
@@ -411,9 +429,11 @@ function RangeChart({ rows }: { rows: HydropostHistoryEntry[] }) {
             <rect x={cx} y={yHi} width={bW} height={barH} fill="#1d4ed8" fillOpacity={0.45} rx={3} />
             <line x1={cx} y1={yHi} x2={cx + bW} y2={yHi} stroke="#60a5fa" strokeWidth={2} strokeLinecap="round" />
             <line x1={cx} y1={yLo} x2={cx + bW} y2={yLo} stroke="#3b82f6" strokeWidth={2} strokeLinecap="round" />
-            <text x={cx + bW / 2} y={H - 4} textAnchor="middle" fontSize={9} fill="#6e7681">
-              {String(h.year).slice(2)}
-            </text>
+            {shouldLabel(i, rows.length) && (
+              <text x={cx + bW / 2} y={H - 4} textAnchor="middle" fontSize={9} fill="#6e7681">
+                {String(h.year).slice(2)}
+              </text>
+            )}
           </g>
         );
       })}

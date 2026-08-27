@@ -45,8 +45,8 @@ a {
   animation: slideInLeft 0.22s ease;
 }
 
-/* Dark Mapbox popup */
-.edumap-popup .mapboxgl-popup-content {
+/* Dark MapLibre popup */
+.edumap-popup .maplibregl-popup-content {
   background: #1c2128;
   border: 1px solid rgba(255,255,255,0.12);
   border-radius: 10px;
@@ -56,10 +56,10 @@ a {
   color: #c9d1d9;
   box-shadow: 0 6px 24px rgba(0,0,0,0.55);
 }
-.edumap-popup .mapboxgl-popup-tip {
+.edumap-popup .maplibregl-popup-tip {
   border-top-color: #1c2128 !important;
   border-bottom-color: #1c2128 !important;
 }
-.edumap-popup .mapboxgl-popup-close-button {
+.edumap-popup .maplibregl-popup-close-button {
   display: none;
 }

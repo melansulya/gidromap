@@ -2,41 +2,48 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
-import { hydroposts, getHydropostHistory, analyzeLowWaterRisk } from "@/lib/akmolaMapData";
+import { hydroposts as allHydroposts, getHydropostHistory, analyzeLowWaterRisk } from "@/lib/akmolaMapData";
 import { runLocalMechanism } from "@/lib/aiMechanisms";
 import { getAuthFromToken } from "@/lib/auth";
 import { logActivity } from "@/lib/activityLog";
-import type { ChatResponse, MapState, Place } from "@/lib/types";
+import type { ChatResponse, MapState, Place, Region, RiverWidthSegment } from "@/lib/types";
+
+function hydropostsFor(region: Region) {
+  return allHydroposts.filter((p) => p.region === region);
+}
 
 // ─── Places cache ─────────────────────────────────────────────────────────────
 
-let placesCache: Place[] | null = null;
+const placesCache = new Map<Region, Place[]>();
 
 // ─── Water objects cache ──────────────────────────────────────────────────────
 
 type WaterEntry = { id: string; name: string };
-let waterCache2: WaterEntry[] | null = null;
+const waterCache2 = new Map<Region, WaterEntry[]>();
 
-function loadWaterObjects(): WaterEntry[] {
-  if (waterCache2) return waterCache2;
+function loadWaterObjects(region: Region): WaterEntry[] {
+  const cached = waterCache2.get(region);
+  if (cached) return cached;
+  let result: WaterEntry[];
   try {
     const bodies = JSON.parse(
-      fs.readFileSync(path.join(process.cwd(), "public", "akmola-water-bodies.json"), "utf-8")
+      fs.readFileSync(path.join(process.cwd(), "public", `${region}-water-bodies.json`), "utf-8")
     ) as Array<{ id: string; name?: string }>;
     const ways = JSON.parse(
-      fs.readFileSync(path.join(process.cwd(), "public", "akmola-waterways.json"), "utf-8")
+      fs.readFileSync(path.join(process.cwd(), "public", `${region}-waterways.json`), "utf-8")
     ) as Array<{ id: string; name?: string }>;
-    waterCache2 = [...bodies, ...ways]
+    result = [...bodies, ...ways]
       .filter((w) => w.name && w.name.trim().length > 1)
       .map((w) => ({ id: w.id, name: w.name! }));
   } catch {
-    waterCache2 = [];
+    result = [];
   }
-  return waterCache2;
+  waterCache2.set(region, result);
+  return result;
 }
 
-function findWaterIds(query: string): string[] {
-  const objects = loadWaterObjects();
+function findWaterIds(query: string, region: Region): string[] {
+  const objects = loadWaterObjects(region);
   // Strip common prefixes
   const q = query.toLowerCase()
     .replace(/^(р\.|р\s+|река\s+|оз\.|оз\s+|озеро\s+|вдхр\.|вдхр\s+|водохранилище\s+)/i, "")
@@ -49,13 +56,23 @@ function findWaterIds(query: string): string[] {
     "есил":  ["есіл", "есиль"],
     "нура":  ["нур"],
     "нур":   ["нура"],
-    "силеты": ["cілеті", "силети"],
-    "селеты": ["cілеті", "силеты", "селети"],
+    // NB: previously had a Latin "c" here instead of Cyrillic "с" (сілеті) —
+    // visually identical but never matches real Cyrillic text. Silently
+    // broke both aliases below since they were first written.
+    "силеты": ["сілеті", "силети"],
+    "селеты": ["сілеті", "силеты", "селети"],
     "жыланды": ["жиланды"],
     "бурабай": ["бурабай көлі"],
-    "копа":  ["копа", "копа-копа"],
-    "зеренды": ["зеренды"],
+    "копа":  ["копа", "копа-копа", "қопа"],
+    "зеренды": ["зеренды", "зеренді"],
     "шортан": ["шортанкөл", "шортанды"],
+    "терисаккан": ["терісаққан"],
+    "калкутан": ["қалқұтан"],
+    "боксук": ["боқсық"],
+    // "Астанинское водохранилище" and "Арнасай бөгені" are the same reservoir
+    // under two different names — confirmed by hydropost coordinates
+    // (с. Михайловка, с. Арнасай) falling inside its polygon bounds.
+    "астанинское": ["арнасай"],
   };
   if (aliases[q]) variants.push(...aliases[q]);
 
@@ -67,18 +84,46 @@ function findWaterIds(query: string): string[] {
     .map((w) => w.id);
 }
 
-function loadPlaces(): Place[] {
-  if (placesCache) return placesCache;
+// ─── River width cache (GRWL — Global River Widths from Landsat, CC-BY 4.0,
+// Allen & Pavelsky 2018) ────────────────────────────────────────────────────
+// Pre-extracted once for our two regions from the public GRWL_summaryStats
+// dataset (Zenodo, static one-time download — no live foreign API at
+// runtime, same pattern as the terrain DEM data). GRWL only resolves rivers
+// roughly >=30m wide, so a river missing from this file isn't necessarily
+// narrow — it just wasn't detected/reported by GRWL.
+
+const riverWidthCache = new Map<Region, RiverWidthSegment[]>();
+
+function loadRiverWidths(region: Region): RiverWidthSegment[] {
+  const cached = riverWidthCache.get(region);
+  if (cached) return cached;
+  let result: RiverWidthSegment[];
+  try {
+    result = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), "public", `${region}-river-widths.json`), "utf-8")
+    ) as RiverWidthSegment[];
+  } catch {
+    result = [];
+  }
+  riverWidthCache.set(region, result);
+  return result;
+}
+
+function loadPlaces(region: Region): Place[] {
+  const cached = placesCache.get(region);
+  if (cached) return cached;
+  let result: Place[];
   try {
     const raw = fs.readFileSync(
-      path.join(process.cwd(), "public", "akmola-places.json"),
+      path.join(process.cwd(), "public", `${region}-places.json`),
       "utf-8",
     );
-    placesCache = JSON.parse(raw) as Place[];
+    result = JSON.parse(raw) as Place[];
   } catch {
-    placesCache = [];
+    result = [];
   }
-  return placesCache;
+  placesCache.set(region, result);
+  return result;
 }
 
 function normName(s: string) {
@@ -89,8 +134,8 @@ function normName(s: string) {
     .trim();
 }
 
-function matchPlaceNames(names: string[]): string[] {
-  const places = loadPlaces();
+function matchPlaceNames(names: string[], region: Region): string[] {
+  const places = loadPlaces(region);
   return names.flatMap((n) => {
     const needle = normName(n);
     const found =
@@ -326,6 +371,28 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "get_river_widths",
+      description:
+        "Найти реки/участки рек шириной не менее заданного порога (в метрах). Используй при вопросах 'какие реки шириной от N метров', 'сколько рек шире N метров', 'ширина реки X'. Данные из GRWL (спутниковые измерения Landsat) — покрывают не всю речную сеть, только реки примерно от 30м, измерено участками (реках может быть несколько участков с разной шириной).",
+      parameters: {
+        type: "object",
+        properties: {
+          min_width_m: {
+            type: "number",
+            description: "Минимальная медианная ширина в метрах (по умолчанию 40)",
+          },
+          river_name: {
+            type: "string",
+            description: "Необязательно: название конкретной реки для фильтра (частичное совпадение, без префиксов р./оз.)",
+          },
+        },
+        required: ["min_width_m"],
+      },
+    },
+  },
 ];
 
 // ─── Tool execution ───────────────────────────────────────────────────────────
@@ -340,8 +407,8 @@ function execFilterHydroposts(args: {
   river?: string;
   district?: string;
   sort_by?: string;
-}): ToolResult {
-  let posts = [...hydroposts];
+}, region: Region): ToolResult {
+  let posts = hydropostsFor(region);
   if (args.status !== "any") {
     posts = posts.filter((p) => p.status === args.status);
   }
@@ -375,8 +442,8 @@ function execFilterHydroposts(args: {
   };
 }
 
-function execFindPostsNearCity(args: { city_name: string; radius_km: number }): ToolResult {
-  const places = loadPlaces();
+function execFindPostsNearCity(args: { city_name: string; radius_km: number }, region: Region): ToolResult {
+  const places = loadPlaces(region);
   const needle = normName(args.city_name);
   const city =
     places.find((p) => normName(p.name) === needle) ??
@@ -386,7 +453,7 @@ function execFindPostsNearCity(args: { city_name: string; radius_km: number }): 
     return { data: { error: `Город "${args.city_name}" не найден в базе данных.` } };
   }
 
-  const nearby = hydroposts.filter(
+  const nearby = hydropostsFor(region).filter(
     (p) => haversineKm(city.coordinates, p.coordinates) <= args.radius_km,
   );
 
@@ -412,8 +479,8 @@ function execFindPostsNearCity(args: { city_name: string; radius_km: number }): 
   };
 }
 
-function execGetHistory(args: { post_code: number }): ToolResult {
-  const post = hydroposts.find((p) => p.code === args.post_code);
+function execGetHistory(args: { post_code: number }, region: Region): ToolResult {
+  const post = hydropostsFor(region).find((p) => p.code === args.post_code);
   if (!post) return { data: { error: `Пост с кодом ${args.post_code} не найден.` } };
 
   const history = getHydropostHistory(args.post_code);
@@ -438,9 +505,9 @@ function execGetHistory(args: { post_code: number }): ToolResult {
 function execSpatialCoverage(args: {
   interval_km: number;
   main_rivers_only: boolean;
-}): ToolResult {
+}, region: Region): ToolResult {
   const query = `нужно установить каждые ${args.interval_km} км вдоль рек. Считать только основные реки: ${args.main_rivers_only ? "да" : "нет"}.`;
-  const result = runLocalMechanism(query);
+  const result = runLocalMechanism(query, region);
 
   if (!result) {
     return { data: { error: "Не удалось выполнить пространственный анализ." } };
@@ -457,7 +524,7 @@ function execSpatialCoverage(args: {
       highlightedPostCodes: result.markers.map((p) => p.code),
       highlightedWaterIds: result.spatialOverlay?.highlightedWaterIds ?? [],
       suggestedPlacements: result.spatialOverlay?.suggestedPlacements ?? [],
-      layer: "all",
+      layer: "water",
     },
   };
 }
@@ -466,11 +533,11 @@ function execFindSettlementsNearPosts(args: {
   radius_km: number;
   river?: string;
   district?: string;
-}): ToolResult {
-  const places = loadPlaces();
+}, region: Region): ToolResult {
+  const places = loadPlaces(region);
   const matched = new Set<string>();
 
-  let targetPosts = hydroposts;
+  let targetPosts = hydropostsFor(region);
   if (args.river) {
     const r = args.river.toLowerCase();
     targetPosts = targetPosts.filter((p) => p.waterBody.toLowerCase().includes(r));
@@ -513,8 +580,8 @@ function execFindSettlementsNearPosts(args: {
   };
 }
 
-function execMarkSettlements(args: { names: string[] }): ToolResult {
-  const ids = matchPlaceNames(args.names);
+function execMarkSettlements(args: { names: string[] }, region: Region): ToolResult {
+  const ids = matchPlaceNames(args.names, region);
   return {
     data: {
       requested: args.names.length,
@@ -555,8 +622,8 @@ function execResetMap(): ToolResult {
   };
 }
 
-function execDetectLowWaterRisk(args: { post_code?: number; river?: string }): ToolResult {
-  let targets = hydroposts;
+function execDetectLowWaterRisk(args: { post_code?: number; river?: string }, region: Region): ToolResult {
+  let targets = hydropostsFor(region);
   if (args.post_code != null) {
     targets = targets.filter((p) => p.code === args.post_code);
   } else if (args.river) {
@@ -609,8 +676,8 @@ function execDetectLowWaterRisk(args: { post_code?: number; river?: string }): T
   };
 }
 
-function execHighlightWater(args: { water_name: string }): ToolResult {
-  const ids = findWaterIds(args.water_name);
+function execHighlightWater(args: { water_name: string }, region: Region): ToolResult {
+  const ids = findWaterIds(args.water_name, region);
   if (ids.length === 0) {
     return { data: { error: `Водный объект "${args.water_name}" не найден в базе данных карты.` } };
   }
@@ -620,25 +687,53 @@ function execHighlightWater(args: { water_name: string }): ToolResult {
       highlightedWaterIds: ids,
       highlightedDistricts: [],
       highlightedPostCodes: [],
-      layer: "all",
+      layer: "water",
     },
   };
 }
 
-function executeTool(name: string, args: Record<string, unknown>): ToolResult {
+function execRiverWidths(args: { min_width_m?: number; river_name?: string }, region: Region): ToolResult {
+  const minWidth = typeof args.min_width_m === "number" && Number.isFinite(args.min_width_m) ? args.min_width_m : 40;
+  let segments = loadRiverWidths(region).filter((s) => !s.isLake && s.widthMedianM >= minWidth);
+
+  if (args.river_name) {
+    const needle = args.river_name.toLowerCase().trim();
+    segments = segments.filter((s) => s.name && s.name.toLowerCase().includes(needle));
+  }
+
+  const distinctNames = new Set(segments.map((s) => s.name).filter((n): n is string => n !== null));
+
+  return {
+    data: {
+      minWidthM: minWidth,
+      source: "GRWL (Global River Widths from Landsat, Allen & Pavelsky 2018) — измерено участками по спутниковым снимкам, покрывает реки примерно от 30м",
+      segmentsFound: segments.length,
+      distinctNamedRivers: distinctNames.size,
+      segments: segments.map((s) => ({
+        name: s.name ?? "неопознанный участок (нет рядом именованной реки в наших данных)",
+        widthMedianM: s.widthMedianM,
+        widthMeanM: s.widthMeanM,
+        widthMaxM: s.widthMaxM,
+        lengthKm: s.lengthKm,
+      })),
+    },
+  };
+}
+
+function executeTool(name: string, args: Record<string, unknown>, region: Region): ToolResult {
   switch (name) {
     case "filter_hydroposts":
-      return execFilterHydroposts(args as Parameters<typeof execFilterHydroposts>[0]);
+      return execFilterHydroposts(args as Parameters<typeof execFilterHydroposts>[0], region);
     case "find_posts_near_city":
-      return execFindPostsNearCity(args as Parameters<typeof execFindPostsNearCity>[0]);
+      return execFindPostsNearCity(args as Parameters<typeof execFindPostsNearCity>[0], region);
     case "get_hydropost_history":
-      return execGetHistory(args as Parameters<typeof execGetHistory>[0]);
+      return execGetHistory(args as Parameters<typeof execGetHistory>[0], region);
     case "get_spatial_coverage":
-      return execSpatialCoverage(args as Parameters<typeof execSpatialCoverage>[0]);
+      return execSpatialCoverage(args as Parameters<typeof execSpatialCoverage>[0], region);
     case "find_settlements_near_posts":
-      return execFindSettlementsNearPosts(args as Parameters<typeof execFindSettlementsNearPosts>[0]);
+      return execFindSettlementsNearPosts(args as Parameters<typeof execFindSettlementsNearPosts>[0], region);
     case "mark_settlements":
-      return execMarkSettlements(args as Parameters<typeof execMarkSettlements>[0]);
+      return execMarkSettlements(args as Parameters<typeof execMarkSettlements>[0], region);
     case "change_map_layer":
       return execChangeLayer(args as Parameters<typeof execChangeLayer>[0]);
     case "highlight_district":
@@ -646,9 +741,11 @@ function executeTool(name: string, args: Record<string, unknown>): ToolResult {
     case "reset_map":
       return execResetMap();
     case "highlight_water":
-      return execHighlightWater(args as Parameters<typeof execHighlightWater>[0]);
+      return execHighlightWater(args as Parameters<typeof execHighlightWater>[0], region);
     case "detect_low_water_risk":
-      return execDetectLowWaterRisk(args as Parameters<typeof execDetectLowWaterRisk>[0]);
+      return execDetectLowWaterRisk(args as Parameters<typeof execDetectLowWaterRisk>[0], region);
+    case "get_river_widths":
+      return execRiverWidths(args as Parameters<typeof execRiverWidths>[0], region);
     default:
       return { data: { error: `Unknown tool: ${name}` } };
   }
@@ -711,15 +808,56 @@ function isRateLimited(key: string): boolean {
 
 const MODEL = process.env.DEEPSEEK_MODEL ?? "deepseek-chat";
 
-const SYSTEM_PROMPT = `Ты — AI-ассистент AI Gidromap, интерактивной карты мониторинга гидропостов Акмолинской области Казахстана.
+type RegionMeta = {
+  regionTitle: string;
+  postCount: number;
+  factsBlock: string;
+  exampleDistricts: string;
+  exampleRiver: string;
+  exampleWaterNames: string;
+};
+
+const REGION_META: Record<Region, RegionMeta> = {
+  akmola: {
+    regionTitle: "Акмолинской области",
+    postCount: 28,
+    factsBlock: [
+      "• 28 гидропостов на реках и озёрах Акмолинской области",
+      "• Районы с гидропостами: Аккольский, Аршалынский, Астраханский, Атбасарский, Буландынский, Бурабайский, Ерейментауский, Есильский, Жаркаинский, Зерендинский, Коргалжынский, Сандыктауский, Целиноградский, Шортандинский, Астана (город), Кокшетау (город)",
+      "• Реки с постами: р. Есиль (Ишим), р. Нура, р. Жабай, р. Силеты, р. Селеты, р. Калкутан, р. Терисаккан, р. Жыланды, р. Аршалы, р. Мойылды, р. Боксук, р. Шагалалы",
+      "• Озёра/водохранилища: оз. Бурабай, оз. Копа, оз. Зеренды, оз. Шортан, Астанинское водохранилище",
+      "• Исторические ряды наблюдений: по 20 постам за 2016–2022 гг. (по некоторым — с 1940–1970-х) — данные по каждому году (наивысший уровень, открытая вода макс/мин, амплитуда)",
+      "• Населённые пункты области в базе: города, посёлки, сёла с координатами",
+    ].join("\n"),
+    exampleDistricts: `"Аршалынский район", "г. Кокшетау", "Есильский район"`,
+    exampleRiver: "Есиль",
+    exampleWaterNames: `"Есиль", "Нура", "Жабай", "Силеты", "Бурабай", "Копа", "Зеренды", "Шортан"`,
+  },
+  kyzylorda: {
+    regionTitle: "Кызылординской области",
+    postCount: 13,
+    factsBlock: [
+      "• 13 гидропостов: большинство на реке Сырдарья (включая протоку Караозек) и на Малом Аральском море, один — Бесарык — на одноимённой реке/канале",
+      "• Районы с гидропостами: Жанакорганский, Шиелийский, Сырдарьинский, Кармакшинский, Казалинский, Аральский районы, Кызылординская городская администрация",
+      "• Реки с постами: р. Сырдарья (в т.ч. протока Караозек), р. Бесарык",
+      "• Водоёмы: Аральское море, Малое Аральское море (район Кокаральской плотины)",
+      "• Исторические ряды наблюдений по этим постам ПОКА НЕ ПОДКЛЮЧЕНЫ — будут добавлены позже",
+      "• Текущий уровень воды (waterLevel) для всех постов этого региона — ПЛЕЙСХОЛДЕР (0), это НЕ реальное измерение. Если спрашивают про текущий уровень или статус конкретного поста — честно говори, что данные по текущему уровню ещё не подключены, НИКОГДА не называй 0 см как настоящий уровень воды",
+      "• Населённые пункты области в базе: города, посёлки, сёла с координатами",
+    ].join("\n"),
+    exampleDistricts: `"Казалинский район", "Аральский район", "Кызылординская городская администрация"`,
+    exampleRiver: "Сырдарья",
+    exampleWaterNames: `"Сырдарья", "Аральское море", "Малое Аральское море"`,
+  },
+};
+
+function buildSystemPrompt(region: Region): string {
+  const meta = REGION_META[region];
+  const posts = hydropostsFor(region);
+  return `Ты — AI-ассистент AI Gidromap, интерактивной карты мониторинга гидропостов ${meta.regionTitle} Казахстана.
 
 ━━ ДАННЫЕ В СИСТЕМЕ ━━
-• 28 гидропостов на реках и озёрах Акмолинской области
-• Районы с гидропостами: Аккольский, Аршалынский, Астраханский, Атбасарский, Буландынский, Бурабайский, Ерейментауский, Есильский, Жаркаинский, Зерендинский, Коргалжынский, Сандыктауский, Целиноградский, Шортандинский, Астана (город), Кокшетау (город)
-• Реки с постами: р. Есиль (Ишим), р. Нура, р. Жабай, р. Силеты, р. Селеты, р. Калкутан, р. Терисаккан, р. Жыланды, р. Аршалы, р. Мойылды, р. Боксук, р. Шагалалы
-• Озёра/водохранилища: оз. Бурабай, оз. Копа, оз. Зеренды, оз. Шортан, Астанинское водохранилище
-• Исторические ряды наблюдений: по 20 постам за 2016–2022 гг. — данные по каждому году (наивысший уровень, открытая вода макс/мин, амплитуда)
-• Населённые пункты области в базе: города, посёлки, сёла с координатами
+${meta.factsBlock}
 
 ━━ КАРТА — ТЫ УМЕЕШЬ ЕЁ РЕДАКТИРОВАТЬ ━━
 У тебя есть полный контроль над картой. ВСЕГДА вызывай инструменты для обновления карты.
@@ -732,14 +870,14 @@ filter_hydroposts — подсветить посты, автоматическ�
 highlight_district — подсветить район(ы) оранжевой рамкой на карте
   → ОБЯЗАТЕЛЬНО вызывай при: "выдели район", "покажи район", "выдели его", "покажи на карте", "отметь район"
   → "выдели этот район" / "его" / "этот" = используй район из предыдущего контекста разговора
-  → district_names: точные названия — "Аршалынский район", "г. Кокшетау", "Есильский район" и т.д.
+  → district_names: точные названия — ${meta.exampleDistricts} и т.д.
 
 reset_map — очистить все выделения
   → при: "очисти", "сбрось", "убери выделение", "покажи всё"
 
 highlight_water — выделить реку или озеро синими линиями на карте
-  → ОБЯЗАТЕЛЬНО вызывай при: "выдели реку", "покажи реку", "выдели озеро", "выдели р. Есиль" и любых похожих
-  → water_name: только название БЕЗ префиксов — "Есиль", "Нура", "Жабай", "Силеты", "Бурабай", "Копа", "Зеренды", "Шортан"
+  → ОБЯЗАТЕЛЬНО вызывай при: "выдели реку", "покажи реку", "выдели озеро", "выдели р. ${meta.exampleRiver}" и любых похожих
+  → water_name: только название БЕЗ префиксов — ${meta.exampleWaterNames}
 
 change_map_layer — переключить слой
   → "водные объекты" → water | "только посты" → hydroposts | "все" → all
@@ -759,15 +897,21 @@ detect_low_water_risk — анализ риска маловодья по ист
   → ВЫЗЫВАЙ при: "риск маловодья", "маловодье на реке", "исторически низкий уровень", "маловодный год"
   → подсвечивает посты с умеренным и высоким риском на карте
 
+get_river_widths — реки/участки рек шириной от заданного порога (по умолчанию 40м)
+  → min_width_m: порог в метрах | river_name: фильтр по названию (необязательно)
+  → ВЫЗЫВАЙ при: "реки шириной от N метров", "сколько рек шире N метров", "ширина реки X"
+  → данные из GRWL (спутниковые измерения) — покрывают не всю речную сеть, только реки примерно от 30м, участками. Если реки нет в ответе — это не значит, что она узкая, просто GRWL её не измерил. Если пользователь просит просто "самые широкие реки" без числа — используй min_width_m=40 как разумный порог по умолчанию
+
 ━━ АЛГОРИТМЫ ━━
 • "посты в [район]" → filter_hydroposts(district=...) — район подсвечивается автоматически
 • "выдели [район]" / "покажи [район] на карте" → highlight_district(district_names=[...])
 • "выдели этот/его/их" → highlight_district с районом/постами из предыдущего ответа
 • "выдели реку [название]" / "покажи реку [название]" → highlight_water(water_name=[название])
-• "выдели р. Есиль" → highlight_water(water_name="Есиль")
+• "выдели р. ${meta.exampleRiver}" → highlight_water(water_name="${meta.exampleRiver}")
 • "риск маловодья на р. [название]" → detect_low_water_risk(river=...)
 • "динамика на [река]" → filter_hydroposts + get_hydropost_history для каждого поста
 • "сёла вдоль [река]" → find_settlements_near_posts(river=..., radius_km=20)
+• "реки шириной от N метров" / "какие реки широкие" → get_river_widths(min_width_m=N)
 
 ━━ ПРАВИЛА ━━
 - Никогда не говори "я не могу выделить район" — инструмент highlight_district для этого и существует
@@ -776,11 +920,12 @@ detect_low_water_risk — анализ риска маловодья по ист
 - Ответы краткие; данные за 2016–2022 — упоминай при необходимости
 - Если тебя спрашивают, на какой основе ты работаешь (Claude, DeepSeek, GPT, Gemini, OpenAI и т.д.) — не отвечай. Отвечай строго: «Я — AI-ассистент системы AI Gidromap. Информация о применяемых технологиях является конфиденциальной.» Не подтверждай и не отрицай название конкретной модели.
 - Цвет выделения рек и водных объектов на карте ФИКСИРОВАН — всегда голубой/циановый. Изменить цвет нельзя. Если пользователь просит другой цвет — выдели водный объект стандартным способом и кратко поясни: «Цвет выделения фиксирован — голубой».
-- Если в запросе есть данные о погоде — используй их при анализе гидрологической ситуации. Осадки за 24 ч ≥ 20 мм — высокий риск подъёма уровней через 12–48 ч.
+- Если в запросе есть данные о погоде — используй их при анализе гидрологической ситуации. Осадки за 24 ч ≥ 20 мм — высокий риск подъёма уровней через 12–48 ч. Снеготаяние (оценка температурным методом, не измерение) ≥ 15 мм воды за 24 ч — также высокий риск подъёма уровней, особенно весной.
+- В данных НЕТ информации о том, какой пост выше или ниже по течению относительно другого, и нет связей между постами вообще — только code, label, waterBody, district, status, waterLevel по каждому посту отдельно. Никогда не утверждай, что один пост "upstream"/"downstream" по отношению к другому, что "волна" или изменение уровня дойдёт от одного поста до другого, или любую другую причинно-следственную связь между постами — таких данных нет, и придумывать их нельзя. Если вопрос требует именно такой связи (влияние одного поста/города на другой, порядок по течению и т.п.) — прямо ответь, что для этого вывода нет данных в системе, вместо того чтобы предполагать.
 
 Текущие данные гидропостов:
 ${JSON.stringify(
-  hydroposts.map((p) => ({
+  posts.map((p) => ({
     code: p.code,
     label: p.label,
     waterBody: p.waterBody,
@@ -791,6 +936,7 @@ ${JSON.stringify(
   null,
   0,
 )}`;
+}
 
 type DeepSeekMessage = {
   role: "system" | "user" | "assistant" | "tool";
@@ -803,6 +949,7 @@ async function runAgent(
   query: string,
   sessionId: string,
   mapContext: string | null,
+  region: Region,
 ): Promise<{ answer: string; mapUpdate: Partial<MapState> | null }> {
   const key = process.env.DEEPSEEK_API_KEY;
   if (!key) throw new Error("DEEPSEEK_API_KEY missing");
@@ -810,7 +957,7 @@ async function runAgent(
   const prior = getSessionMessages(sessionId);
 
   const messages: DeepSeekMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: buildSystemPrompt(region) },
     ...prior,
   ];
 
@@ -861,7 +1008,7 @@ async function runAgent(
     // Execute each tool call
     for (const toolCall of msg.tool_calls) {
       const args = JSON.parse(toolCall.function.arguments) as Record<string, unknown>;
-      const result = executeTool(toolCall.function.name, args);
+      const result = executeTool(toolCall.function.name, args, region);
 
       // Merge map updates
       if (result.mapUpdate) {
@@ -890,6 +1037,7 @@ const ChatBodySchema = z.object({
   sessionId: z.string().max(200).optional(),
   chatId: z.string().max(200).optional(),
   mapContext: z.string().max(4000).optional(),
+  region: z.enum(["akmola", "kyzylorda"]).default("akmola"),
 });
 
 export async function POST(request: NextRequest) {
@@ -914,7 +1062,7 @@ export async function POST(request: NextRequest) {
 
   let resp: ChatResponse;
   try {
-    const { answer, mapUpdate } = await runAgent(query, sessionId, body.mapContext ?? null);
+    const { answer, mapUpdate } = await runAgent(query, sessionId, body.mapContext ?? null, body.region);
     resp = { answer, mapUpdate, clarification: null, sessionId };
   } catch (err) {
     console.error("[Agent error]", err);

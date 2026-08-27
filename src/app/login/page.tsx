@@ -10,6 +10,8 @@ export default function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [tempToken, setTempToken] = useState<string | null>(null);
+  const [code, setCode] = useState("");
 
   useEffect(() => {
     fetch("/api/auth/me").then((res) => {
@@ -32,6 +34,31 @@ export default function LoginPage() {
         setError(data.error ?? "Ошибка входа");
         return;
       }
+      if (data.needs2fa) {
+        setTempToken(data.tempToken);
+        return;
+      }
+      router.push("/");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleVerify2fa(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+    try {
+      const res = await fetch("/api/auth/login/2fa", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tempToken, code: code.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error ?? "Ошибка входа");
+        return;
+      }
       router.push("/");
     } finally {
       setLoading(false);
@@ -44,57 +71,87 @@ export default function LoginPage() {
         <span style={s.badge}>AI Gidromap</span>
         <p style={s.subtitle}>Карта гидропостов Акмолинской области</p>
 
-        <form onSubmit={handleSubmit} style={s.form}>
-          <label style={s.label}>Email</label>
-          <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="email@example.com"
-            required
-            style={s.input}
-            autoComplete="email"
-          />
-
-          <label style={s.label}>Пароль</label>
-          <div style={s.passwordWrap}>
+        {tempToken ? (
+          <form onSubmit={handleVerify2fa} style={s.form}>
+            <label style={s.label}>Код из приложения-аутентификатора</label>
             <input
-              type={showPassword ? "text" : "password"}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="••••••••"
+              type="text"
+              inputMode="numeric"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              placeholder="123456"
               required
-              style={s.passwordInput}
-              autoComplete="current-password"
+              maxLength={6}
+              autoFocus
+              style={{ ...s.input, letterSpacing: "0.3em", textAlign: "center" as const, fontSize: 18 }}
             />
+
+            {error && <p style={s.error}>{error}</p>}
+
+            <button type="submit" disabled={loading} style={s.btn}>
+              {loading ? "Проверка..." : "Подтвердить"}
+            </button>
             <button
               type="button"
-              onClick={() => setShowPassword((v) => !v)}
-              style={s.eyeBtn}
-              tabIndex={-1}
-              aria-label={showPassword ? "Скрыть пароль" : "Показать пароль"}
+              onClick={() => { setTempToken(null); setCode(""); setError(""); }}
+              style={{ ...s.btn, background: "transparent", color: "#6e7681", marginTop: 8 }}
             >
-              {showPassword ? (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
-                  <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
-                  <line x1="1" y1="1" x2="23" y2="23" />
-                </svg>
-              ) : (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                  <circle cx="12" cy="12" r="3" />
-                </svg>
-              )}
+              Назад
             </button>
-          </div>
+          </form>
+        ) : (
+          <form onSubmit={handleSubmit} style={s.form}>
+            <label style={s.label}>Email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="email@example.com"
+              required
+              style={s.input}
+              autoComplete="email"
+            />
 
-          {error && <p style={s.error}>{error}</p>}
+            <label style={s.label}>Пароль</label>
+            <div style={s.passwordWrap}>
+              <input
+                type={showPassword ? "text" : "password"}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                required
+                style={s.passwordInput}
+                autoComplete="current-password"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                style={s.eyeBtn}
+                tabIndex={-1}
+                aria-label={showPassword ? "Скрыть пароль" : "Показать пароль"}
+              >
+                {showPassword ? (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+                    <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                    <line x1="1" y1="1" x2="23" y2="23" />
+                  </svg>
+                ) : (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                )}
+              </button>
+            </div>
 
-          <button type="submit" disabled={loading} style={s.btn}>
-            {loading ? "Вход..." : "Войти"}
-          </button>
-        </form>
+            {error && <p style={s.error}>{error}</p>}
+
+            <button type="submit" disabled={loading} style={s.btn}>
+              {loading ? "Вход..." : "Войти"}
+            </button>
+          </form>
+        )}
 
         <p style={s.hint}>Доступ только для авторизованных пользователей</p>
       </div>

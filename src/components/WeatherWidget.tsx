@@ -2,10 +2,17 @@
 
 import { useEffect, useState } from "react";
 import type { WeatherPoint } from "@/app/api/weather/route";
+import type { Region } from "@/lib/types";
 
 interface Props {
+  region: Region;
   onWeatherSummary?: (summary: string) => void;
 }
+
+const REGION_TITLE: Record<Region, string> = {
+  akmola: "Акмолинская область",
+  kyzylorda: "Кызылординская область",
+};
 
 const ICON_SVG: Record<string, React.ReactNode> = {
   sun: (
@@ -82,7 +89,7 @@ const PRECIP_COLOR = {
   high:     { color: "#ef4444",  label: "Сильные осадки" },
 };
 
-export function WeatherWidget({ onWeatherSummary }: Props) {
+export function WeatherWidget({ region, onWeatherSummary }: Props) {
   const [open, setOpen] = useState(false);
   const [data, setData] = useState<WeatherPoint[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -90,7 +97,8 @@ export function WeatherWidget({ onWeatherSummary }: Props) {
 
   useEffect(() => {
     setLoading(true);
-    fetch("/api/weather")
+    setData(null);
+    fetch(`/api/weather?region=${region}`)
       .then((r) => r.json())
       .then((d: WeatherPoint[]) => {
         setData(d);
@@ -98,17 +106,18 @@ export function WeatherWidget({ onWeatherSummary }: Props) {
 
         // Build text summary for AI
         if (onWeatherSummary) {
-          const lines = d.map(
-            (w) => `${w.name}: ${w.temp}°C, ${w.condition}, осадки за 24ч: ${w.precip24h} мм, ветер ${w.windspeed} км/ч`,
-          );
+          const lines = d.map((w) => {
+            const melt = w.snowMeltMm24h > 0 ? `, снеготаяние за 24ч: ~${w.snowMeltMm24h} мм` : "";
+            return `${w.name}: ${w.temp}°C, ${w.condition}, осадки за 24ч: ${w.precip24h} мм${melt}, ветер ${w.windspeed} км/ч`;
+          });
           onWeatherSummary(
-            `[Погода в Акмолинской области (данные Open-Meteo): ${lines.join("; ")}]`,
+            `[Погода в ${REGION_TITLE[region]} (данные Open-Meteo): ${lines.join("; ")}]`,
           );
         }
       })
       .catch(() => setData(null))
       .finally(() => setLoading(false));
-  }, [onWeatherSummary]);
+  }, [region, onWeatherSummary]);
 
   const maxPrecip = data ? Math.max(...data.map((d) => d.precip24h), 0.1) : 1;
   const anyRain = data?.some((d) => d.precipLevel !== "none");
@@ -124,7 +133,7 @@ export function WeatherWidget({ onWeatherSummary }: Props) {
           borderColor: anyRain ? "#ef444440" : "rgba(255,255,255,0.1)",
           color: anyRain ? "#fca5a5" : "#8b949e",
         }}
-        title="Погода в Акмолинской области"
+        title={`Погода в ${REGION_TITLE[region]}`}
       >
         <span style={s.toggleIcon}>
           {ICON_SVG[loading ? "cloud" : (anyRain ? "rain" : "sun")]}
@@ -137,7 +146,7 @@ export function WeatherWidget({ onWeatherSummary }: Props) {
       {open && data && (
         <div style={s.panel} className="detail-panel-in">
           <div style={s.panelHeader}>
-            <span style={s.panelTitle}>Акмолинская область</span>
+            <span style={s.panelTitle}>{REGION_TITLE[region]}</span>
             <span style={s.panelTime}>обновлено {updatedAt}</span>
             <button onClick={() => setOpen(false)} style={s.closeBtn}>×</button>
           </div>
@@ -172,6 +181,14 @@ export function WeatherWidget({ onWeatherSummary }: Props) {
                   {w.precip24h > 0 && (
                     <div style={s.barTrack}>
                       <div style={{ ...s.barFill, width: `${barPct}%`, background: pc.color }} />
+                    </div>
+                  )}
+
+                  {w.snowMeltMm24h > 0 && (
+                    <div style={s.precipRow}>
+                      <span style={{ ...s.precipLabel, color: "#60a5fa" }}>
+                        ❄️ снеготаяние ~{w.snowMeltMm24h} мм/24ч
+                      </span>
                     </div>
                   )}
                 </div>

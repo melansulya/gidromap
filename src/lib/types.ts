@@ -1,5 +1,7 @@
 export type Layer = "all" | "hydroposts" | "water";
 
+export type Region = "akmola" | "kyzylorda";
+
 export type SuggestedPlacement = {
   id: string;
   label: string;
@@ -16,6 +18,7 @@ export type MapState = {
   layer: Layer;
   showPlaces: boolean;
   showDistricts: boolean;
+  showHydroposts: boolean;
 };
 
 export type Place = {
@@ -54,4 +57,21 @@ export type WaterObject = {
   kind: "river" | "lake" | "reservoir";
   geometry: "polyline" | "polygon";
   coordinates: [number, number][] | [number, number][][];
+};
+
+// One measured reach from the GRWL (Global River Widths from Landsat) dataset —
+// CC-BY 4.0, Allen & Pavelsky (2018). `name` is our own nearest-named-waterway
+// match (within 3km), not a GRWL field — null when nothing matched confidently.
+// GRWL only resolves rivers roughly >=30m wide, so absence from this file does
+// not mean a river is narrow, only that GRWL didn't detect/report it.
+export type RiverWidthSegment = {
+  id: string;
+  name: string | null;
+  widthMinM: number;
+  widthMedianM: number;
+  widthMeanM: number;
+  widthMaxM: number;
+  lengthKm: number;
+  isLake: boolean;
+  coordinates: [number, number][];
 };

@@ -5,11 +5,6 @@ export type PolylineWaterObject = WaterObject & {
   coordinates: [number, number][];
 };
 
-export type MeasurePoint = {
-  objectId: string;
-  coordinates: [number, number];
-};
-
 export type MeasureResult =
   | { status: "success"; objectName: string; distanceKm: number }
   | { status: "error"; message: string };
@@ -183,73 +178,6 @@ export function buildGraph(objects: PolylineWaterObject[]): Graph {
   }
 
   return { adj, seq, pts };
-}
-
-// ─── Dijkstra between two projected points ───────────────────────────────────
-
-export function measureDistance(
-  graph: Graph,
-  startObj: PolylineWaterObject,
-  startProj: NonNullable<ReturnType<typeof projectPointToPolyline>>,
-  endObj: PolylineWaterObject,
-  endProj: NonNullable<ReturnType<typeof projectPointToPolyline>>,
-): number | null {
-  const startSeq = graph.seq.get(startObj.id);
-  const endSeq = graph.seq.get(endObj.id);
-  if (!startSeq || !endSeq) return null;
-
-  const TS = "__ms__";
-  const TE = "__me__";
-  const adj = new Map(graph.adj);
-
-  const si = Math.min(startProj.segmentIndex, startSeq.keys.length - 2);
-  const ei = Math.min(endProj.segmentIndex, endSeq.keys.length - 2);
-
-  adj.set(TS, [
-    { to: startSeq.keys[si], weightKm: startProj.chainageKm - startSeq.cum[si], objectId: startObj.id },
-    { to: startSeq.keys[si + 1], weightKm: startSeq.cum[si + 1] - startProj.chainageKm, objectId: startObj.id },
-  ]);
-
-  function linkToEnd(nodeKey: string, w: number) {
-    const list = [...(adj.get(nodeKey) ?? [])];
-    list.push({ to: TE, weightKm: w, objectId: endObj.id });
-    adj.set(nodeKey, list);
-  }
-  linkToEnd(endSeq.keys[ei], endProj.chainageKm - endSeq.cum[ei]);
-  linkToEnd(endSeq.keys[ei + 1], endSeq.cum[ei + 1] - endProj.chainageKm);
-  adj.set(TE, []);
-
-  if (startObj.id === endObj.id) {
-    const direct = adj.get(TS)!;
-    direct.push({ to: TE, weightKm: Math.abs(startProj.chainageKm - endProj.chainageKm), objectId: startObj.id });
-  }
-
-  // Dijkstra
-  const dist = new Map<string, number>([[TS, 0]]);
-  const visited = new Set<string>();
-  const queue = new Set<string>([TS]);
-
-  while (queue.size > 0) {
-    let cur: string | null = null;
-    let curDist = Infinity;
-    for (const n of queue) {
-      const d = dist.get(n) ?? Infinity;
-      if (d < curDist) { cur = n; curDist = d; }
-    }
-    if (!cur) break;
-    queue.delete(cur);
-    if (cur === TE) return curDist;
-    if (visited.has(cur)) continue;
-    visited.add(cur);
-    for (const edge of adj.get(cur) ?? []) {
-      const nd = curDist + edge.weightKm;
-      if (nd < (dist.get(edge.to) ?? Infinity)) {
-        dist.set(edge.to, nd);
-        queue.add(edge.to);
-      }
-    }
-  }
-  return null;
 }
 
 // ─── Water path trace with route reconstruction ───────────────────────────────

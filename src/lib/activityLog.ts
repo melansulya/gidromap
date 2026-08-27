@@ -7,7 +7,8 @@ export type ActivityAction =
   | "view_water_object"
   | "measure_distance"
   | "water_trace"
-  | "export_doc";
+  | "export_doc"
+  | "switch_region";
 
 export async function logActivity(entry: {
   email: string;

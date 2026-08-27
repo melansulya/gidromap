@@ -1,17 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import mapboxgl from "mapbox-gl";
-import "mapbox-gl/dist/mapbox-gl.css";
-import { hydroposts, type Hydropost } from "@/lib/akmolaMapData";
-import type { Layer, Place, SuggestedPlacement, WaterObject } from "@/lib/types";
+import maplibregl from "maplibre-gl";
+import "maplibre-gl/dist/maplibre-gl.css";
+import { hydroposts as allHydroposts, type Hydropost } from "@/lib/akmolaMapData";
+import type { Layer, Place, Region, SuggestedPlacement, WaterObject } from "@/lib/types";
 import {
   buildGraph,
   haversineKm,
-  measureDistance,
   measureWaterPath,
   projectPointToPolyline,
-  type MeasurePoint,
   type MeasureResult,
   type PolylineWaterObject,
   type WaterTraceResult,
@@ -19,12 +17,36 @@ import {
 
 // ── Map styles ────────────────────────────────────────────────────────────────
 
+// Self-hosted-friendly vector styles — no API key, no foreign token, tiles
+// served from OpenFreeMap (OSM data).
+//
+// "imagery" is real satellite/aerial photography — Esri World Imagery, free,
+// no API key, no account. Foreign (US) live tiles, same tradeoff as
+// OpenFreeMap before self-hosting — kept because Sentinel (our self-hosted
+// snapshot) is only 10m/pixel and too coarse to see much at street scale.
+const ESRI_IMAGERY_STYLE: maplibregl.StyleSpecification = {
+  version: 8,
+  sources: {
+    "esri-imagery": {
+      type: "raster",
+      tiles: ["https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+      tileSize: 256,
+      maxzoom: 19,
+      attribution: "Esri, Maxar, Earthstar Geographics",
+    },
+  },
+  layers: [{ id: "esri-imagery-layer", type: "raster", source: "esri-imagery" }],
+};
+
 const MAP_STYLES = {
-  dark: "mapbox://styles/mapbox/dark-v11",
-  satellite: "mapbox://styles/mapbox/satellite-streets-v12",
+  dark: "https://tiles.openfreemap.org/styles/dark",
+  bright: "https://tiles.openfreemap.org/styles/bright",
+  imagery: ESRI_IMAGERY_STYLE,
 } as const;
 
 type MapStyleKey = keyof typeof MAP_STYLES;
+const STYLE_ORDER: MapStyleKey[] = ["dark", "bright", "imagery"];
+const STYLE_LABEL: Record<MapStyleKey, string> = { dark: "Тёмная", bright: "Светлая", imagery: "Спутник" };
 
 // ── Data fetchers (module-level cache) ────────────────────────────────────────
 
@@ -36,57 +58,79 @@ type DistrictFeature = {
   };
 };
 
-let waterCache: WaterObject[] | null = null;
-let graphCache: ReturnType<typeof buildGraph> | null = null;
-let waterLoadPromise: Promise<WaterObject[]> | null = null;
-let placesCache: Place[] | null = null;
-let districtsCache: DistrictFeature[] | null = null;
-let borderCache: [number, number][][] | null = null;
+const waterCache = new Map<Region, WaterObject[]>();
+const graphCacheMap = new Map<Region, ReturnType<typeof buildGraph>>();
+const waterLoadPromise = new Map<Region, Promise<WaterObject[]>>();
+const placesCacheMap = new Map<Region, Place[]>();
+const districtsCache = new Map<Region, DistrictFeature[]>();
+const borderCache = new Map<Region, [number, number][][]>();
 
-function fetchWaterObjects(): Promise<WaterObject[]> {
-  if (waterCache) return Promise.resolve(waterCache);
-  if (!waterLoadPromise) {
-    waterLoadPromise = Promise.all([
-      fetch("/akmola-water-bodies.json").then((r) => r.json() as Promise<WaterObject[]>),
-      fetch("/akmola-waterways.json").then((r) => r.json() as Promise<WaterObject[]>),
-      fetch("/akmola-hydro-rivers.json")
-        .then((r) => r.json() as Promise<WaterObject[]>)
-        .catch(() => [] as WaterObject[]),
+const REGION_VIEW: Record<Region, { center: [number, number]; zoom: number }> = {
+  akmola: { center: [70.45, 52.25], zoom: 7.1 },
+  kyzylorda: { center: [63.55, 45.08], zoom: 6.4 },
+};
+
+function fetchWaterObjects(region: Region): Promise<WaterObject[]> {
+  const cached = waterCache.get(region);
+  if (cached) return Promise.resolve(cached);
+  let pending = waterLoadPromise.get(region);
+  if (!pending) {
+    // akmola-hydro-rivers.json is an extra supplemental dataset with no
+    // per-region equivalent yet — only fetch it for akmola.
+    const extra =
+      region === "akmola"
+        ? fetch("/akmola-hydro-rivers.json")
+            .then((r) => r.json() as Promise<WaterObject[]>)
+            .catch(() => [] as WaterObject[])
+        : Promise.resolve([] as WaterObject[]);
+    pending = Promise.all([
+      fetch(`/${region}-water-bodies.json`).then((r) => r.json() as Promise<WaterObject[]>),
+      fetch(`/${region}-waterways.json`).then((r) => r.json() as Promise<WaterObject[]>),
+      extra,
     ]).then(([bodies, ways, rivers]) => {
-      waterCache = [...bodies, ...ways, ...rivers];
-      return waterCache;
+      const combined = [...bodies, ...ways, ...rivers];
+      waterCache.set(region, combined);
+      return combined;
     });
+    waterLoadPromise.set(region, pending);
   }
-  return waterLoadPromise;
+  return pending;
 }
 
-function fetchPlaces(): Promise<Place[]> {
-  if (placesCache) return Promise.resolve(placesCache);
-  return fetch("/akmola-places.json")
+function fetchPlaces(region: Region): Promise<Place[]> {
+  const cached = placesCacheMap.get(region);
+  if (cached) return Promise.resolve(cached);
+  return fetch(`/${region}-places.json`)
     .then((r) => r.json() as Promise<Place[]>)
-    .then((d) => { placesCache = d; return d; })
+    .then((d) => { placesCacheMap.set(region, d); return d; })
     .catch(() => []);
 }
 
-function fetchDistricts(): Promise<DistrictFeature[]> {
-  if (districtsCache) return Promise.resolve(districtsCache);
-  return fetch("/akmola-districts.geojson")
+function fetchDistricts(region: Region): Promise<DistrictFeature[]> {
+  const cached = districtsCache.get(region);
+  if (cached) return Promise.resolve(cached);
+  return fetch(`/${region}-districts.geojson`)
     .then((r) => r.json())
-    .then((d) => { districtsCache = d?.features ?? []; return districtsCache!; })
+    .then((d) => { const features = d?.features ?? []; districtsCache.set(region, features); return features; })
     .catch(() => []);
 }
 
-function fetchBorder(): Promise<[number, number][][]> {
-  if (borderCache) return Promise.resolve(borderCache);
-  return fetch("/akmola-border.geojson")
+function fetchBorder(region: Region): Promise<[number, number][][]> {
+  const cached = borderCache.get(region);
+  if (cached) return Promise.resolve(cached);
+  return fetch(`/${region}-border.geojson`)
     .then((r) => r.json())
-    .then((d) => { borderCache = d?.features?.[0]?.geometry?.coordinates ?? []; return borderCache!; })
+    .then((d) => { const rings = d?.features?.[0]?.geometry?.coordinates ?? []; borderCache.set(region, rings); return rings; })
     .catch(() => []);
+}
+
+function hydropostsFor(region: Region): Hydropost[] {
+  return allHydroposts.filter((p) => p.region === region);
 }
 
 // ── Layer helpers (pure, no refs) ─────────────────────────────────────────────
 
-function setupBorderLayer(map: mapboxgl.Map, rings: [number, number][][]) {
+function setupBorderLayer(map: maplibregl.Map, rings: [number, number][][]) {
   if (map.getLayer("border-line")) map.removeLayer("border-line");
   if (map.getSource("border")) map.removeSource("border");
   if (!rings.length) return;
@@ -98,17 +142,17 @@ function setupBorderLayer(map: mapboxgl.Map, rings: [number, number][][]) {
 }
 
 function districtExpr(highlighted: string[]) {
-  if (!highlighted.length) return ["boolean", false] as mapboxgl.ExpressionSpecification;
-  return ["in", ["get", "name"], ["literal", highlighted]] as mapboxgl.ExpressionSpecification;
+  if (!highlighted.length) return ["boolean", false] as maplibregl.ExpressionSpecification;
+  return ["in", ["get", "name"], ["literal", highlighted]] as maplibregl.ExpressionSpecification;
 }
 
 function setupDistrictLayers(
-  map: mapboxgl.Map,
+  map: maplibregl.Map,
   districts: DistrictFeature[],
   highlighted: string[],
   visible: boolean,
 ) {
-  ["districts-labels", "districts-line", "districts-fill"].forEach((id) => {
+  ["districts-labels", "districts-line", "districts-fill", "districts-hit"].forEach((id) => {
     if (map.getLayer(id)) map.removeLayer(id);
   });
   if (map.getSource("districts")) map.removeSource("districts");
@@ -176,7 +220,7 @@ function setupDistrictLayers(
   });
 }
 
-function updateDistrictPaint(map: mapboxgl.Map, highlighted: string[]) {
+function updateDistrictPaint(map: maplibregl.Map, highlighted: string[]) {
   if (!map.getLayer("districts-fill")) return;
   const expr = districtExpr(highlighted);
   map.setPaintProperty("districts-fill", "fill-color", ["case", expr, "#f97316", "transparent"]);
@@ -211,7 +255,7 @@ function shouldRender(obj: WaterObject, highlighted: boolean): boolean {
 }
 
 function setupWaterLayers(
-  map: mapboxgl.Map,
+  map: maplibregl.Map,
   objects: WaterObject[],
   highlighted: string[],
   currentLayer: Layer,
@@ -219,9 +263,12 @@ function setupWaterLayers(
   ["water-fills", "water-lines", "water-lines-hit"].forEach((id) => { if (map.getLayer(id)) map.removeLayer(id); });
   ["water-fills-src", "water-lines-src", "water-lines-hit-src"].forEach((id) => { if (map.getSource(id)) map.removeSource(id); });
 
-  // Always render water so clicks work in any layer mode.
-  // In hydroposts-only mode, reduce opacity so water is subtle but clickable.
-  const dim = currentLayer === "hydroposts";
+  // "Водные объекты" toggle off (layer !== "water") — hide water entirely,
+  // same as the hydroposts toggle hides markers. Ruler/water-trace snapping
+  // still works regardless (renderedPolylinesRef is filled independently).
+  if (currentLayer !== "water") return;
+
+  const dim = false;
 
   // Hit features: ALL polylines (no length filter) so short river segments are still clickable
   const polyHitFeats: GeoJSON.Feature[] = objects
@@ -296,7 +343,7 @@ function setupWaterLayers(
   }
 }
 
-function drawTracePath(map: mapboxgl.Map, path: [number, number][]) {
+function drawTracePath(map: maplibregl.Map, path: [number, number][]) {
   if (map.getLayer("trace-path")) map.removeLayer("trace-path");
   if (map.getSource("trace-path-src")) map.removeSource("trace-path-src");
   if (path.length < 2) return;
@@ -317,12 +364,12 @@ function drawTracePath(map: mapboxgl.Map, path: [number, number][]) {
   });
 }
 
-function clearTracePath(map: mapboxgl.Map) {
+function clearTracePath(map: maplibregl.Map) {
   if (map.getLayer("trace-path")) map.removeLayer("trace-path");
   if (map.getSource("trace-path-src")) map.removeSource("trace-path-src");
 }
 
-function drawMeasureLine(map: mapboxgl.Map, from: [number, number], to: [number, number]) {
+function drawMeasureLine(map: maplibregl.Map, from: [number, number], to: [number, number]) {
   if (map.getLayer("measure-line")) map.removeLayer("measure-line");
   if (map.getSource("measure-line-src")) map.removeSource("measure-line-src");
   map.addSource("measure-line-src", {
@@ -341,30 +388,141 @@ function drawMeasureLine(map: mapboxgl.Map, from: [number, number], to: [number,
   });
 }
 
-function clearMeasureLine(map: mapboxgl.Map) {
+function clearMeasureLine(map: maplibregl.Map) {
   if (map.getLayer("measure-line")) map.removeLayer("measure-line");
   if (map.getSource("measure-line-src")) map.removeSource("measure-line-src");
 }
 
-function setup3DBuildings(map: mapboxgl.Map) {
+type SatelliteMeta = { bbox: [number, number, number, number]; imageUrl: string };
+
+function setupSatelliteLayer(map: maplibregl.Map, meta: SatelliteMeta | null, visible: boolean) {
+  if (map.getLayer("satellite-overlay")) map.removeLayer("satellite-overlay");
+  if (map.getSource("satellite-overlay-src")) map.removeSource("satellite-overlay-src");
+  if (!visible || !meta) return;
+  const [minLon, minLat, maxLon, maxLat] = meta.bbox;
+  map.addSource("satellite-overlay-src", {
+    type: "image",
+    url: meta.imageUrl,
+    coordinates: [
+      [minLon, maxLat],
+      [maxLon, maxLat],
+      [maxLon, minLat],
+      [minLon, minLat],
+    ],
+  });
+  map.addLayer({
+    id: "satellite-overlay",
+    type: "raster",
+    source: "satellite-overlay-src",
+    paint: { "raster-opacity": 0.92 },
+  });
+}
+
+// Self-hosted 3D terrain — elevation tiles built once from Copernicus DEM,
+// served from our own server (src/lib/terrainTiles.ts), no live foreign call.
+// Each region's tile pyramid can have a different max zoom (rio-rgbify --min-z/--max-z
+// at build time — Kyzylorda was built shallower than Akmola to keep the mbtiles
+// file small) — minzoom/maxzoom must match what was actually built or MapLibre
+// either 404s below minzoom or fails to overzoom correctly past maxzoom.
+const TERRAIN_ZOOM: Record<Region, { min: number; max: number }> = {
+  akmola: { min: 5, max: 11 },
+  kyzylorda: { min: 5, max: 9 },
+};
+
+function setupTerrainSource(map: maplibregl.Map, region: Region, visible: boolean) {
+  if (!visible) {
+    map.setTerrain(null);
+    if (map.getSource("terrain-dem")) map.removeSource("terrain-dem");
+    return;
+  }
+  if (!map.getSource("terrain-dem")) {
+    const zoom = TERRAIN_ZOOM[region];
+    map.addSource("terrain-dem", {
+      type: "raster-dem",
+      tiles: [`/api/terrain/{z}/{x}/{y}.png?region=${region}`],
+      tileSize: 512,
+      minzoom: zoom.min,
+      maxzoom: zoom.max,
+      encoding: "mapbox",
+    });
+  }
+  map.setTerrain({ source: "terrain-dem", exaggeration: 1.5 });
+}
+
+// Hypsometric tint (color-by-elevation) — plain pre-rendered colored tiles,
+// same DEM/tile grid as the 3D terrain — but instead of MapLibre's native
+// color-relief layer (needs v6, which broke rendering entirely when tested)
+// tiles are colorized server-side on every request from the terrain-RGB
+// elevation data (src/lib/elevationColor.ts), using whatever min/max the
+// current viewport reports via /api/relief/stats. That's what makes the tint
+// rescale as you pan/zoom instead of using one fixed range for the whole
+// region — mirrors RELATIVE_STOPS server-side exactly, keep both in sync.
+const RELIEF_ZOOM: Record<Region, { min: number; max: number }> = TERRAIN_ZOOM;
+const RELIEF_DEFAULT_RANGE: Record<Region, { min: number; max: number }> = {
+  akmola: { min: 46, max: 923 },
+  kyzylorda: { min: 20, max: 600 },
+};
+const RELIEF_RELATIVE_STOPS: { t: number; color: string }[] = [
+  { t: 0, color: "rgb(34,85,51)" },
+  { t: 0.12, color: "rgb(76,153,76)" },
+  { t: 0.20, color: "rgb(154,191,94)" },
+  { t: 0.27, color: "rgb(216,209,112)" },
+  { t: 0.34, color: "rgb(222,173,105)" },
+  { t: 0.43, color: "rgb(199,134,84)" },
+  { t: 0.57, color: "rgb(163,101,68)" },
+  { t: 0.75, color: "rgb(140,96,82)" },
+  { t: 1.0, color: "rgb(245,245,240)" },
+];
+
+function reliefTileUrl(region: Region, min: number, max: number): string {
+  return `/api/relief/{z}/{x}/{y}.png?region=${region}&min=${Math.round(min)}&max=${Math.round(max)}`;
+}
+
+function setupReliefLayer(map: maplibregl.Map, region: Region, visible: boolean, min: number, max: number) {
+  if (!visible) {
+    if (map.getLayer("relief-layer")) map.removeLayer("relief-layer");
+    if (map.getSource("relief-src")) map.removeSource("relief-src");
+    return;
+  }
+  if (!map.getSource("relief-src")) {
+    const zoom = RELIEF_ZOOM[region];
+    map.addSource("relief-src", {
+      type: "raster",
+      tiles: [reliefTileUrl(region, min, max)],
+      tileSize: 512,
+      minzoom: zoom.min,
+      maxzoom: zoom.max,
+    });
+    map.addLayer({
+      id: "relief-layer",
+      type: "raster",
+      source: "relief-src",
+      paint: { "raster-opacity": 0.85 },
+    });
+  }
+}
+
+function setup3DBuildings(map: maplibregl.Map) {
   if (map.getLayer("3d-buildings")) map.removeLayer("3d-buildings");
+  // OpenFreeMap/OpenMapTiles schema: source "openmaptiles", building heights come
+  // as render_height/render_min_height (not Mapbox's height/min_height/extrude).
+  if (!map.getSource("openmaptiles")) return;
   try {
     map.addLayer({
       id: "3d-buildings",
-      source: "composite",
+      source: "openmaptiles",
       "source-layer": "building",
-      filter: ["==", "extrude", "true"],
       type: "fill-extrusion",
-      minzoom: 15,
+      minzoom: 14,
       paint: {
         "fill-extrusion-color": "#334455",
-        "fill-extrusion-height": ["interpolate", ["linear"], ["zoom"], 15, 0, 15.05, ["get", "height"]],
-        "fill-extrusion-base": ["interpolate", ["linear"], ["zoom"], 15, 0, 15.05, ["get", "min_height"]],
-        "fill-extrusion-opacity": 0.75,
+        "fill-extrusion-height": ["interpolate", ["linear"], ["zoom"], 14, 0, 14.05, ["get", "render_height"]],
+        "fill-extrusion-base": ["interpolate", ["linear"], ["zoom"], 14, 0, 14.05, ["coalesce", ["get", "render_min_height"], 0]],
+        "fill-extrusion-opacity": 0.8,
       },
     });
   } catch {
-    // composite source may not exist on some tile sets
+    // style variant without a building layer
   }
 }
 
@@ -424,11 +582,14 @@ function ringCentroid(coords: [number, number][]): [number, number] {
 function postPopupHTML(post: Hydropost): string {
   const sc = post.status === "danger" ? "#ef4444" : post.status === "warning" ? "#f59e0b" : "#22c55e";
   const sl = post.status === "danger" ? "Опасно" : post.status === "warning" ? "Внимание" : "Норма";
+  const levelLine = post.hasLevelData
+    ? `<div style="font-size:13px;font-weight:600;color:${sc}">${post.waterLevel} см <span style="font-size:10px;font-weight:400;opacity:0.75">${sl}</span></div>`
+    : `<div style="font-size:12px;font-weight:500;color:#6e7681">Нет данных</div>`;
   return `
     <div style="font-weight:600;color:#e6edf3;font-size:13px;margin-bottom:3px">${post.label}</div>
     <div style="font-size:11px;color:#60a5fa;margin-bottom:1px">${post.waterBody}</div>
     <div style="font-size:11px;color:#6e7681;margin-bottom:6px">${post.district}</div>
-    <div style="font-size:13px;font-weight:600;color:${sc}">${post.waterLevel} см <span style="font-size:10px;font-weight:400;opacity:0.75">${sl}</span></div>`;
+    ${levelLine}`;
 }
 
 const PLACE_KIND: Record<string, string> = {
@@ -442,11 +603,11 @@ function placePopupHTML(place: Place): string {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-const LAYERS: { value: Layer; label: string }[] = [
-  { value: "all", label: "Все слои" },
-  { value: "hydroposts", label: "Гидропосты" },
-  { value: "water", label: "Водные объекты" },
-];
+
+// How far a click may be from the nearest rendered river and still snap to it
+// in water-trace mode (settlements sit near water, not exactly on it, so this
+// is more forgiving than the ruler tool's 5 km).
+const TRACE_SNAP_MAX_KM = 8;
 
 type TracePoint = {
   coords: [number, number];
@@ -456,6 +617,7 @@ type TracePoint = {
 };
 
 type Props = {
+  region: Region;
   activePostCode: number | null;
   highlightedPostCodes: number[];
   highlightedWaterIds: string[];
@@ -465,6 +627,7 @@ type Props = {
   layer: Layer;
   showPlaces: boolean;
   showDistricts: boolean;
+  showHydroposts: boolean;
   isMeasureMode: boolean;
   isWaterTraceMode: boolean;
   onPostClick: (code: number) => void;
@@ -472,6 +635,7 @@ type Props = {
   onLayerChange: (layer: Layer) => void;
   onTogglePlaces: () => void;
   onToggleDistricts: () => void;
+  onToggleHydroposts: () => void;
   onMeasureResult: (result: MeasureResult) => void;
   onWaterTraceResult: (result: WaterTraceResult) => void;
 };
@@ -479,6 +643,7 @@ type Props = {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function AkmolaMap({
+  region,
   activePostCode,
   highlightedPostCodes,
   highlightedWaterIds,
@@ -488,6 +653,7 @@ export function AkmolaMap({
   layer,
   showPlaces,
   showDistricts,
+  showHydroposts,
   isMeasureMode,
   isWaterTraceMode,
   onPostClick,
@@ -495,22 +661,22 @@ export function AkmolaMap({
   onLayerChange,
   onTogglePlaces,
   onToggleDistricts,
+  onToggleHydroposts,
   onMeasureResult,
   onWaterTraceResult,
 }: Props) {
-  const token = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
   const containerRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<mapboxgl.Map | null>(null);
+  const mapRef = useRef<maplibregl.Map | null>(null);
 
-  const popupRef = useRef<mapboxgl.Popup | null>(null);
+  const popupRef = useRef<maplibregl.Popup | null>(null);
   const suppressMapClickRef = useRef(false); // prevents map click after marker click
 
   // Marker instances (survive style changes automatically)
-  const markerRefs = useRef<mapboxgl.Marker[]>([]);
-  const suggestedRefs = useRef<mapboxgl.Marker[]>([]);
-  const measureMarkerRefs = useRef<mapboxgl.Marker[]>([]);
-  const placeRefs = useRef<mapboxgl.Marker[]>([]);
-  const hlPlaceRefs = useRef<mapboxgl.Marker[]>([]);
+  const markerRefs = useRef<maplibregl.Marker[]>([]);
+  const suggestedRefs = useRef<maplibregl.Marker[]>([]);
+  const measureMarkerRefs = useRef<maplibregl.Marker[]>([]);
+  const placeRefs = useRef<maplibregl.Marker[]>([]);
+  const hlPlaceRefs = useRef<maplibregl.Marker[]>([]);
 
   // Cached data from fetch
   const borderDataRef = useRef<[number, number][][] | null>(null);
@@ -518,13 +684,18 @@ export function AkmolaMap({
   const waterDataRef = useRef<WaterObject[] | null>(null);
 
   // Current prop values as refs (for style.load handler)
+  const regionRef = useRef(region);
   const layerRef = useRef(layer);
   const hlWaterRef = useRef(highlightedWaterIds);
   const hlDistrictsRef = useRef(highlightedDistricts);
   const showDistrictsRef = useRef(showDistricts);
 
   // Measure
-  const measureFirstRef = useRef<MeasurePoint | null>(null);
+  const measureFirstRef = useRef<[number, number] | null>(null);
+  // True right after a measurement finishes — the parent auto-flips isMeasureMode
+  // to false at that point too, so the cleanup effect needs to tell "just finished,
+  // keep the result visible" apart from "user cancelled, wipe it".
+  const measureJustCompletedRef = useRef(false);
   const isMeasureRef = useRef(isMeasureMode);
   const onMeasureResultRef = useRef(onMeasureResult);
   const renderedPolylinesRef = useRef<PolylineWaterObject[]>([]);
@@ -532,17 +703,39 @@ export function AkmolaMap({
 
   // Water trace
   const traceFirstRef = useRef<TracePoint | null>(null);
-  const traceMeasureMarkersRef = useRef<mapboxgl.Marker[]>([]);
+  const traceMeasureMarkersRef = useRef<maplibregl.Marker[]>([]);
   const isWaterTraceRef = useRef(isWaterTraceMode);
   const onWaterClickRef = useRef(onWaterClick);
   const onWaterTraceResultRef = useRef(onWaterTraceResult);
   const [traceStep, setTraceStep] = useState<0 | 1>(0);
+  const [traceMsg, setTraceMsg] = useState<string | null>(null);
+  const traceJustCompletedRef = useRef(false);
 
   const [ready, setReady] = useState(false);
   const [mapStyle, setMapStyle] = useState<MapStyleKey>("dark");
   const layersInitRef = useRef(false);
 
+  // Sentinel satellite overlay (self-hosted cache — see /api/satellite)
+  const [showSatellite, setShowSatellite] = useState(false);
+  const [satelliteLoading, setSatelliteLoading] = useState(false);
+  const [satelliteError, setSatelliteError] = useState<string | null>(null);
+  const [satelliteDate, setSatelliteDate] = useState<number | null>(null);
+  const satelliteMetaRef = useRef<SatelliteMeta | null>(null);
+  const showSatelliteRef = useRef(false);
+
+  // Self-hosted 3D terrain (elevation) — see /api/terrain
+  const [showTerrain, setShowTerrain] = useState(false);
+  const showTerrainRef = useRef(false);
+
+  // Hypsometric tint (color-by-elevation) — see /api/relief
+  const [showRelief, setShowRelief] = useState(false);
+  const showReliefRef = useRef(false);
+  const [reliefRange, setReliefRange] = useState(RELIEF_DEFAULT_RANGE[region]);
+  const reliefRangeRef = useRef(reliefRange);
+  const reliefDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Sync refs
+  useEffect(() => { regionRef.current = region; }, [region]);
   useEffect(() => { isMeasureRef.current = isMeasureMode; }, [isMeasureMode]);
   useEffect(() => { onMeasureResultRef.current = onMeasureResult; }, [onMeasureResult]);
   useEffect(() => { layerRef.current = layer; }, [layer]);
@@ -553,19 +746,36 @@ export function AkmolaMap({
   useEffect(() => { onWaterClickRef.current = onWaterClick; }, [onWaterClick]);
   useEffect(() => { onWaterTraceResultRef.current = onWaterTraceResult; }, [onWaterTraceResult]);
 
-  // Measure cleanup — only reset state; markers/line kept until next measurement starts
+  // Measure cleanup — cancelling mid-measurement wipes markers/line off the map;
+  // finishing one keeps it visible (mode still auto-turns off, but nothing to clear).
   useEffect(() => {
     if (!isMeasureMode) {
       measureFirstRef.current = null;
       setMeasureStep(0);
+      if (measureJustCompletedRef.current) {
+        measureJustCompletedRef.current = false;
+      } else {
+        measureMarkerRefs.current.forEach((m) => m.remove());
+        measureMarkerRefs.current = [];
+        if (mapRef.current) clearMeasureLine(mapRef.current);
+      }
     }
   }, [isMeasureMode]);
 
-  // Water trace cleanup — only state; markers kept visible until next session starts
+  // Water trace cleanup — cancelling mid-trace wipes markers/path off the map;
+  // finishing one keeps it visible (mode still auto-turns off, but nothing to clear).
   useEffect(() => {
     if (!isWaterTraceMode) {
       traceFirstRef.current = null;
       setTraceStep(0);
+      setTraceMsg(null);
+      if (traceJustCompletedRef.current) {
+        traceJustCompletedRef.current = false;
+      } else {
+        traceMeasureMarkersRef.current.forEach((m) => m.remove());
+        traceMeasureMarkersRef.current = [];
+        if (mapRef.current) clearTracePath(mapRef.current);
+      }
     }
   }, [isWaterTraceMode]);
 
@@ -576,14 +786,18 @@ export function AkmolaMap({
     const map = mapRef.current;
     if (!map) return;
     let best: { obj: PolylineWaterObject; proj: NonNullable<ReturnType<typeof projectPointToPolyline>> } | null = null;
-    let bestDist = Infinity;
+    let bestDist = TRACE_SNAP_MAX_KM;
     for (const obj of renderedPolylinesRef.current) {
       const proj = projectPointToPolyline(obj.coordinates, coords);
       if (!proj) continue;
       const d = haversineKm(coords, proj.projected);
       if (d < bestDist) { bestDist = d; best = { obj, proj }; }
     }
-    if (!best) return;
+    if (!best) {
+      setTraceMsg(`«${label}» слишком далеко от ближайшей реки (нет воды в пределах ~${TRACE_SNAP_MAX_KM} км) — отсюда след не построить.`);
+      return;
+    }
+    setTraceMsg(null);
     const snapped = best.proj.projected;
     if (!traceFirstRef.current) {
       // Clear markers and path from any previous trace session
@@ -593,17 +807,19 @@ export function AkmolaMap({
       traceFirstRef.current = { coords: snapped, label, obj: best.obj, proj: best.proj };
       setTraceStep(1);
       traceMeasureMarkersRef.current.push(
-        new mapboxgl.Marker({ element: makeMeasureEl("#22d3ee"), anchor: "center" }).setLngLat(snapped).addTo(map),
+        new maplibregl.Marker({ element: makeMeasureEl("#22d3ee"), anchor: "center" }).setLngLat(snapped).addTo(map),
       );
     } else {
       const first = traceFirstRef.current;
       traceFirstRef.current = null;
+      traceJustCompletedRef.current = true;
       traceMeasureMarkersRef.current.push(
-        new mapboxgl.Marker({ element: makeMeasureEl("#f97316"), anchor: "center" }).setLngLat(snapped).addTo(map),
+        new maplibregl.Marker({ element: makeMeasureEl("#f97316"), anchor: "center" }).setLngLat(snapped).addTo(map),
       );
       // Try to find connected water path via graph; show route if found
-      const waterPath = graphCache
-        ? measureWaterPath(graphCache, first.obj, first.proj, best.obj, best.proj)
+      const currentGraph = graphCacheMap.get(regionRef.current);
+      const waterPath = currentGraph
+        ? measureWaterPath(currentGraph, first.obj, first.proj, best.obj, best.proj)
         : null;
       if (waterPath) {
         drawTracePath(map, waterPath.path);
@@ -625,50 +841,42 @@ export function AkmolaMap({
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Which region's data is currently loaded into borderDataRef/districtDataRef/
+  // waterDataRef — null until the first region-data effect run completes.
+  const loadedRegionRef = useRef<Region | null>(null);
+
+  const redrawLayers = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    setupBorderLayer(map, borderDataRef.current ?? []);
+    setupDistrictLayers(map, districtDataRef.current ?? [], hlDistrictsRef.current, showDistrictsRef.current);
+    setupWaterLayers(map, waterDataRef.current ?? [], hlWaterRef.current, layerRef.current);
+    setup3DBuildings(map);
+    setupSatelliteLayer(map, satelliteMetaRef.current, showSatelliteRef.current);
+    setupReliefLayer(map, region, showReliefRef.current, reliefRangeRef.current.min, reliefRangeRef.current.max);
+    setupTerrainSource(map, region, showTerrainRef.current);
+  }, [region]);
+
   // ── Init map ─────────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!token || !containerRef.current) return;
+    if (!containerRef.current) return;
     let cancelled = false;
 
-    mapboxgl.accessToken = token;
-
-    const map = new mapboxgl.Map({
+    const initialView = REGION_VIEW[region];
+    const map = new maplibregl.Map({
       container: containerRef.current,
       style: MAP_STYLES.dark,
-      center: [70.45, 52.25] as [number, number],
-      zoom: 7.1,
+      center: initialView.center,
+      zoom: initialView.zoom,
       maxZoom: 22,
-      antialias: true,
+      canvasContextAttributes: { antialias: true },
     });
 
     mapRef.current = map;
-    map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), "top-right");
+    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
 
-    // Preload places into cache so click proximity works even without places layer enabled
-    fetchPlaces();
-
-    // Fetch data — if map already loaded when data arrives, rebuild layers
-    Promise.all([fetchBorder(), fetchDistricts(), fetchWaterObjects()]).then(([border, districts, water]) => {
-      if (cancelled) return;
-      borderDataRef.current = border;
-      districtDataRef.current = districts;
-      waterDataRef.current = water;
-      const polylines = water.filter(
-        (o): o is PolylineWaterObject => o.geometry === "polyline" && (o.coordinates as [number, number][]).length >= 2,
-      );
-      renderedPolylinesRef.current = polylines;
-      // Pre-build routing graph once on data load (O(n) with spatial hash, ~100ms for 150k coords)
-      if (!graphCache) graphCache = buildGraph(polylines);
-      // Race condition fix: if map loaded before data arrived, rebuild now
-      if (layersInitRef.current) redrawLayers();
-    });
-
-    function redrawLayers() {
-      setupBorderLayer(map, borderDataRef.current ?? []);
-      setupDistrictLayers(map, districtDataRef.current ?? [], hlDistrictsRef.current, showDistrictsRef.current);
-      setupWaterLayers(map, waterDataRef.current ?? [], hlWaterRef.current, layerRef.current);
-      setup3DBuildings(map);
-    }
+    // Region data (border/districts/water/places) is loaded by the dedicated
+    // [region, ready] effect below, once this map instance signals `ready`.
 
     map.on("load", () => {
       if (cancelled) return;
@@ -684,16 +892,17 @@ export function AkmolaMap({
 
     // Map click — water trace / measure mode / feature popup
     map.on("click", (e) => {
+      const currentPlaces = placesCacheMap.get(regionRef.current);
       // ── Water trace mode — highest priority ───────────────────────────────
       if (isWaterTraceRef.current) {
         if (suppressMapClickRef.current) { suppressMapClickRef.current = false; return; }
         const coords: [number, number] = [e.lngLat.lng, e.lngLat.lat];
         let label = `${coords[1].toFixed(3)}°N, ${coords[0].toFixed(3)}°E`;
-        if (placesCache) {
+        if (currentPlaces) {
           let nearest: Place | null = null;
           let nearestDist = 40;
-          for (const place of placesCache) {
-            const pt = map.project(place.coordinates as mapboxgl.LngLatLike);
+          for (const place of currentPlaces) {
+            const pt = map.project(place.coordinates as maplibregl.LngLatLike);
             const dx = e.point.x - pt.x, dy = e.point.y - pt.y;
             const d = Math.sqrt(dx * dx + dy * dy);
             if (d < nearestDist) { nearestDist = d; nearest = place; }
@@ -715,17 +924,17 @@ export function AkmolaMap({
         popupRef.current = null;
 
         // ── Priority: nearest place within 40px (skipped in water-only layer) ──
-        if (placesCache && layerRef.current !== "water") {
+        if (currentPlaces && layerRef.current !== "water") {
           let nearest: Place | null = null;
           let nearestDist = 40;
-          for (const place of placesCache) {
-            const pt = map.project(place.coordinates as mapboxgl.LngLatLike);
+          for (const place of currentPlaces) {
+            const pt = map.project(place.coordinates as maplibregl.LngLatLike);
             const dx = e.point.x - pt.x, dy = e.point.y - pt.y;
             const d = Math.sqrt(dx * dx + dy * dy);
             if (d < nearestDist) { nearestDist = d; nearest = place; }
           }
           if (nearest) {
-            popupRef.current = new mapboxgl.Popup({ closeButton: false, className: "edumap-popup", maxWidth: "200px", offset: 8 })
+            popupRef.current = new maplibregl.Popup({ closeButton: false, className: "edumap-popup", maxWidth: "200px", offset: 8 })
               .setLngLat(nearest.coordinates)
               .setHTML(placePopupHTML(nearest))
               .addTo(map);
@@ -757,8 +966,8 @@ export function AkmolaMap({
           const name = (props.name as string) || "Водный объект";
           const kind = props.kind as string;
           const kindLabel = kind === "river" ? "🏞 Река" : kind === "lake" ? "💧 Озеро" : "🌊 Водохранилище";
-          const postsOnObj = hydroposts.filter((p) => p.waterBody === name);
-          popupRef.current = new mapboxgl.Popup({ closeButton: false, className: "edumap-popup", maxWidth: "240px", offset: 8 })
+          const postsOnObj = hydropostsFor(regionRef.current).filter((p) => p.waterBody === name);
+          popupRef.current = new maplibregl.Popup({ closeButton: false, className: "edumap-popup", maxWidth: "240px", offset: 8 })
             .setLngLat(e.lngLat)
             .setHTML(`
               <div style="font-weight:600;color:#e6edf3;font-size:13px;margin-bottom:4px">${name}</div>
@@ -775,11 +984,11 @@ export function AkmolaMap({
         if (distFeat) {
           const props = distFeat.properties ?? {};
           const name = props.name as string;
-          const posts = hydroposts.filter((p) => p.district === name);
+          const posts = hydropostsFor(regionRef.current).filter((p) => p.district === name);
           const danger = posts.filter((p) => p.status === "danger").length;
           const warning = posts.filter((p) => p.status === "warning").length;
           const normal = posts.length - danger - warning;
-          popupRef.current = new mapboxgl.Popup({ closeButton: false, className: "edumap-popup", maxWidth: "240px", offset: 8 })
+          popupRef.current = new maplibregl.Popup({ closeButton: false, className: "edumap-popup", maxWidth: "240px", offset: 8 })
             .setLngLat(e.lngLat)
             .setHTML(`
               <div style="font-weight:600;color:#e6edf3;font-size:13px;margin-bottom:6px">${name}</div>
@@ -794,20 +1003,8 @@ export function AkmolaMap({
         return;
       }
 
-      // ── Measure mode ──────────────────────────────────────────────────────
+      // ── Measure mode — straight-line distance between two arbitrary points ──
       const coords: [number, number] = [e.lngLat.lng, e.lngLat.lat];
-
-      let best: { obj: PolylineWaterObject; proj: NonNullable<ReturnType<typeof projectPointToPolyline>> } | null = null;
-      let bestDist = 5; // 5 km threshold
-      for (const obj of renderedPolylinesRef.current) {
-        const proj = projectPointToPolyline(obj.coordinates, coords);
-        if (!proj) continue;
-        const dist = haversineKm(coords, proj.projected);
-        if (dist < bestDist) { bestDist = dist; best = { obj, proj }; }
-      }
-      if (!best) return;
-
-      const snapped = best.proj.projected;
 
       if (!measureFirstRef.current) {
         // Clear previous measurement visuals before starting a new one
@@ -815,56 +1012,49 @@ export function AkmolaMap({
         measureMarkerRefs.current = [];
         clearMeasureLine(map);
 
-        measureFirstRef.current = { objectId: best.obj.id, coordinates: snapped };
+        measureFirstRef.current = coords;
         setMeasureStep(1);
         measureMarkerRefs.current.push(
-          new mapboxgl.Marker({ element: makeMeasureEl("#22d3ee"), anchor: "center" })
-            .setLngLat(snapped)
+          new maplibregl.Marker({ element: makeMeasureEl("#22d3ee"), anchor: "center" })
+            .setLngLat(coords)
             .addTo(map),
         );
       } else {
         const first = measureFirstRef.current;
         measureFirstRef.current = null;
-        const firstObj = renderedPolylinesRef.current.find((p) => p.id === first.objectId);
-        if (!firstObj) { onMeasureResultRef.current({ status: "error", message: "Первая точка не найдена." }); return; }
-        const firstProj = projectPointToPolyline(firstObj.coordinates, first.coordinates);
-        if (!firstProj) { onMeasureResultRef.current({ status: "error", message: "Ошибка проекции." }); return; }
 
         measureMarkerRefs.current.push(
-          new mapboxgl.Marker({ element: makeMeasureEl("#f97316"), anchor: "center" })
-            .setLngLat(snapped)
+          new maplibregl.Marker({ element: makeMeasureEl("#f97316"), anchor: "center" })
+            .setLngLat(coords)
             .addTo(map),
         );
 
-        const dist = graphCache ? measureDistance(graphCache, firstObj, firstProj, best.obj, best.proj) : null;
-        const distKm = dist ?? haversineKm(first.coordinates, snapped);
-        const name = firstObj.name === best.obj.name ? best.obj.name : `${firstObj.name} → ${best.obj.name}`;
+        const distKm = haversineKm(first, coords);
 
-        // Draw dashed ruler line between the two snapped points
-        drawMeasureLine(map, first.coordinates, snapped);
+        // Draw dashed ruler line between the two points
+        drawMeasureLine(map, first, coords);
 
         // Distance label at midpoint
-        const mid: [number, number] = [
-          (first.coordinates[0] + snapped[0]) / 2,
-          (first.coordinates[1] + snapped[1]) / 2,
-        ];
+        const mid: [number, number] = [(first[0] + coords[0]) / 2, (first[1] + coords[1]) / 2];
         const labelEl = document.createElement("div");
         labelEl.style.cssText =
           "background:rgba(13,17,23,0.9);color:#22d3ee;border:1px solid rgba(34,211,238,0.3);" +
           "border-radius:6px;padding:3px 8px;font-size:12px;font-weight:700;" +
           "white-space:nowrap;pointer-events:none;backdrop-filter:blur(4px);";
         labelEl.textContent = `${distKm.toFixed(2)} км`;
+        measureJustCompletedRef.current = true;
         measureMarkerRefs.current.push(
-          new mapboxgl.Marker({ element: labelEl, anchor: "center" }).setLngLat(mid).addTo(map),
+          new maplibregl.Marker({ element: labelEl, anchor: "center" }).setLngLat(mid).addTo(map),
         );
 
-        onMeasureResultRef.current({ status: "success", objectName: name, distanceKm: distKm });
+        onMeasureResultRef.current({ status: "success", objectName: "Прямая линия", distanceKm: distKm });
       }
     });
 
     return () => {
       cancelled = true;
       layersInitRef.current = false;
+      loadedRegionRef.current = null;
       [markerRefs, suggestedRefs, measureMarkerRefs, traceMeasureMarkersRef, placeRefs, hlPlaceRefs].forEach((r) => {
         r.current.forEach((m) => m.remove());
         r.current = [];
@@ -873,7 +1063,40 @@ export function AkmolaMap({
       mapRef.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, []);
+
+  // ── Region data (border/districts/water) — loads on first ready, reloads on
+  // region switch and re-centers the map to the new region's default view ──────
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map) return;
+    let cancelled = false;
+    const isInitialLoad = loadedRegionRef.current === null;
+
+    fetchPlaces(region);
+    Promise.all([fetchBorder(region), fetchDistricts(region), fetchWaterObjects(region)]).then(
+      ([border, districts, water]) => {
+        if (cancelled || regionRef.current !== region) return;
+        borderDataRef.current = border;
+        districtDataRef.current = districts;
+        waterDataRef.current = water;
+        const polylines = water.filter(
+          (o): o is PolylineWaterObject => o.geometry === "polyline" && (o.coordinates as [number, number][]).length >= 2,
+        );
+        renderedPolylinesRef.current = polylines;
+        // Pre-build routing graph once per region (O(n) with spatial hash, ~100ms for 150k coords)
+        if (!graphCacheMap.has(region)) graphCacheMap.set(region, buildGraph(polylines));
+        redrawLayers();
+        if (!isInitialLoad) {
+          const view = REGION_VIEW[region];
+          map.easeTo({ center: view.center, zoom: view.zoom });
+        }
+        loadedRegionRef.current = region;
+      },
+    );
+
+    return () => { cancelled = true; };
+  }, [region, ready, redrawLayers]);
 
   // ── Hydropost markers ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -883,12 +1106,13 @@ export function AkmolaMap({
     markerRefs.current.forEach((m) => m.remove());
     markerRefs.current = [];
 
-    if (layer !== "water") {
-      markerRefs.current = hydroposts.map((post) => {
+    const regionPosts = hydropostsFor(region);
+
+    if (showHydroposts) {
+      markerRefs.current = regionPosts.map((post) => {
         const active = post.code === activePostCode;
         const highlighted = highlightedPostCodes.includes(post.code);
         const handleClick = () => {
-          if (layerRef.current === "water") return; // water-only layer: hydropost markers not clickable
           if (isWaterTraceRef.current) {
             suppressMapClickRef.current = true; // block map click that fires after this
             handleTracePoint(post.coordinates, post.label);
@@ -897,29 +1121,29 @@ export function AkmolaMap({
           suppressMapClickRef.current = true;
           onPostClick(post.code);
           popupRef.current?.remove();
-          popupRef.current = new mapboxgl.Popup({ closeButton: false, className: "edumap-popup", maxWidth: "240px", offset: 14 })
+          popupRef.current = new maplibregl.Popup({ closeButton: false, className: "edumap-popup", maxWidth: "240px", offset: 14 })
             .setLngLat(post.coordinates)
             .setHTML(postPopupHTML(post))
             .addTo(map);
         };
-        return new mapboxgl.Marker({ element: makeMarkerEl(post, active, highlighted, handleClick), anchor: "center" })
+        return new maplibregl.Marker({ element: makeMarkerEl(post, active, highlighted, handleClick), anchor: "center" })
           .setLngLat(post.coordinates)
           .addTo(map);
       });
     }
 
     if (highlightedPostCodes.length > 1) {
-      const hPosts = hydroposts.filter((p) => highlightedPostCodes.includes(p.code));
+      const hPosts = regionPosts.filter((p) => highlightedPostCodes.includes(p.code));
       const fit = fitPosts(hPosts);
       if (fit) map.easeTo({ center: fit.center as [number, number], zoom: fit.zoom });
     } else if (highlightedPostCodes.length === 1) {
-      const post = hydroposts.find((p) => p.code === highlightedPostCodes[0]);
+      const post = regionPosts.find((p) => p.code === highlightedPostCodes[0]);
       if (post) map.easeTo({ center: post.coordinates as [number, number], zoom: 10 });
     } else if (activePostCode !== null) {
-      const post = hydroposts.find((p) => p.code === activePostCode);
+      const post = regionPosts.find((p) => p.code === activePostCode);
       if (post) map.easeTo({ center: post.coordinates as [number, number] });
     }
-  }, [activePostCode, highlightedPostCodes, layer, onPostClick, ready]);
+  }, [activePostCode, highlightedPostCodes, onPostClick, ready, showHydroposts, region]);
 
   // ── Water layer ───────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -933,6 +1157,107 @@ export function AkmolaMap({
       );
     }
   }, [highlightedWaterIds, layer, ready]);
+
+  // ── Sentinel satellite overlay ──────────────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map) return;
+    showSatelliteRef.current = showSatellite;
+
+    if (!showSatellite) {
+      setupSatelliteLayer(map, satelliteMetaRef.current, false);
+      return;
+    }
+
+    if (satelliteMetaRef.current) {
+      setupSatelliteLayer(map, satelliteMetaRef.current, true);
+      return;
+    }
+
+    let cancelled = false;
+    setSatelliteLoading(true);
+    setSatelliteError(null);
+    fetch("/api/satellite")
+      .then((r) => r.json())
+      .then((data: { bbox?: [number, number, number, number]; imageUrl?: string; fetchedAt?: number; error?: string }) => {
+        if (cancelled) return;
+        if (data.error || !data.bbox || !data.imageUrl) {
+          setSatelliteError(data.error ?? "Не удалось загрузить снимок");
+          setShowSatellite(false);
+          return;
+        }
+        satelliteMetaRef.current = { bbox: data.bbox, imageUrl: data.imageUrl };
+        setSatelliteDate(data.fetchedAt ?? null);
+        if (mapRef.current) setupSatelliteLayer(mapRef.current, satelliteMetaRef.current, true);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSatelliteError("Не удалось загрузить снимок");
+        setShowSatellite(false);
+      })
+      .finally(() => {
+        if (!cancelled) setSatelliteLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [showSatellite, ready]);
+
+  // ── 3D terrain ───────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map) return;
+    showTerrainRef.current = showTerrain;
+    setupTerrainSource(map, region, showTerrain);
+    // Flat top-down view hides elevation entirely — tilt in/out so the effect is visible.
+    map.easeTo({ pitch: showTerrain ? 60 : 0, duration: 600 });
+  }, [showTerrain, ready, region]);
+
+  // ── Hypsometric tint (color-by-elevation) — rescales to the current viewport,
+  // same idea as topographic-map.com: re-fetch the real min/max for whatever's
+  // on screen after each pan/zoom (debounced) and re-tint via setTiles(),
+  // instead of one fixed range for the whole region. ─────────────────────────
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map) return;
+    showReliefRef.current = showRelief;
+    setupReliefLayer(map, region, showRelief, reliefRangeRef.current.min, reliefRangeRef.current.max);
+    if (!showRelief) return;
+
+    let cancelled = false;
+
+    function refreshStats() {
+      const m = mapRef.current;
+      if (!m) return;
+      const b = m.getBounds();
+      const zoom = Math.round(m.getZoom());
+      const bbox = `${b.getWest()},${b.getSouth()},${b.getEast()},${b.getNorth()}`;
+      fetch(`/api/relief/stats?region=${region}&bbox=${encodeURIComponent(bbox)}&zoom=${zoom}`)
+        .then((r) => r.json())
+        .then((data: { min?: number; max?: number }) => {
+          if (cancelled || !mapRef.current) return;
+          if (typeof data.min !== "number" || typeof data.max !== "number") return;
+          reliefRangeRef.current = { min: data.min, max: data.max };
+          setReliefRange({ min: data.min, max: data.max });
+          const src = mapRef.current.getSource("relief-src") as maplibregl.RasterTileSource | undefined;
+          src?.setTiles([reliefTileUrl(region, data.min, data.max)]);
+        })
+        .catch(() => {});
+    }
+
+    refreshStats();
+
+    function onMoveEnd() {
+      if (reliefDebounceRef.current) clearTimeout(reliefDebounceRef.current);
+      reliefDebounceRef.current = setTimeout(refreshStats, 400);
+    }
+    map.on("moveend", onMoveEnd);
+
+    return () => {
+      cancelled = true;
+      map.off("moveend", onMoveEnd);
+      if (reliefDebounceRef.current) clearTimeout(reliefDebounceRef.current);
+    };
+  }, [showRelief, ready, region]);
 
   // ── Districts layer ───────────────────────────────────────────────────────────
   useEffect(() => {
@@ -957,7 +1282,7 @@ export function AkmolaMap({
     if (!highlightedDistricts.length) return;
 
     // Auto-zoom
-    const districtPosts = hydroposts.filter((p) => highlightedDistricts.includes(p.district));
+    const districtPosts = hydropostsFor(region).filter((p) => highlightedDistricts.includes(p.district));
     if (districtPosts.length > 0) {
       const fit = fitPosts(districtPosts);
       if (fit) map.easeTo({ center: fit.center as [number, number], zoom: fit.zoom });
@@ -972,7 +1297,7 @@ export function AkmolaMap({
         if (firstOuter) map.easeTo({ center: ringCentroid(firstOuter), zoom: 9 });
       }
     }
-  }, [highlightedDistricts, ready]);
+  }, [highlightedDistricts, ready, region]);
 
   // ── Suggested placements ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -982,7 +1307,7 @@ export function AkmolaMap({
     suggestedRefs.current = suggestedPlacements.map((p) => {
       const el = document.createElement("div");
       el.style.cssText = `width:10px;height:10px;border-radius:50%;background:#a78bfa;border:2px solid rgba(167,139,250,0.5);box-shadow:0 0 8px #a78bfa99;`;
-      return new mapboxgl.Marker({ element: el, anchor: "center" }).setLngLat(p.coordinates).addTo(map);
+      return new maplibregl.Marker({ element: el, anchor: "center" }).setLngLat(p.coordinates).addTo(map);
     });
   }, [suggestedPlacements, ready]);
 
@@ -994,7 +1319,7 @@ export function AkmolaMap({
     hlPlaceRefs.current = [];
     if (!highlightedPlaceIds.length) return;
 
-    fetchPlaces().then((places) => {
+    fetchPlaces(region).then((places) => {
       if (!mapRef.current) return;
       hlPlaceRefs.current = places
         .filter((p) => highlightedPlaceIds.includes(p.id))
@@ -1008,10 +1333,10 @@ export function AkmolaMap({
           pin.style.cssText = `width:10px;height:10px;border-radius:50%;background:#f97316;border:2px solid #fff;box-shadow:0 0 10px #f97316;`;
           el.appendChild(label);
           el.appendChild(pin);
-          return new mapboxgl.Marker({ element: el, anchor: "bottom" }).setLngLat(place.coordinates).addTo(mapRef.current!);
+          return new maplibregl.Marker({ element: el, anchor: "bottom" }).setLngLat(place.coordinates).addTo(mapRef.current!);
         });
     });
-  }, [highlightedPlaceIds, ready]);
+  }, [highlightedPlaceIds, ready, region]);
 
   // ── Places layer ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -1021,7 +1346,7 @@ export function AkmolaMap({
     placeRefs.current = [];
     if (!showPlaces) return;
 
-    fetchPlaces().then((places) => {
+    fetchPlaces(region).then((places) => {
       if (!mapRef.current) return;
       placeRefs.current = places.map((place) => {
         const isCapital = place.kind === "national_capital";
@@ -1042,7 +1367,7 @@ export function AkmolaMap({
           }
           suppressMapClickRef.current = true;
           popupRef.current?.remove();
-          popupRef.current = new mapboxgl.Popup({
+          popupRef.current = new maplibregl.Popup({
             closeButton: false, className: "edumap-popup", maxWidth: "200px", offset: 10,
           })
             .setLngLat(place.coordinates)
@@ -1068,20 +1393,16 @@ export function AkmolaMap({
           el.appendChild(dot);
         }
 
-        return new mapboxgl.Marker({ element: el, anchor: "center" }).setLngLat(place.coordinates).addTo(mapRef.current!);
+        return new maplibregl.Marker({ element: el, anchor: "center" }).setLngLat(place.coordinates).addTo(mapRef.current!);
       });
     });
-  }, [showPlaces, ready]);
+  }, [showPlaces, ready, region]);
 
-  // ── Style toggle ──────────────────────────────────────────────────────────────
+  // ── Style toggle — cycles dark → bright → real satellite imagery ───────────────
   function handleStyleToggle() {
-    const next: MapStyleKey = mapStyle === "dark" ? "satellite" : "dark";
+    const next = STYLE_ORDER[(STYLE_ORDER.indexOf(mapStyle) + 1) % STYLE_ORDER.length];
     setMapStyle(next);
     mapRef.current?.setStyle(MAP_STYLES[next]);
-  }
-
-  if (!token) {
-    return <div style={styles.fallback}>Добавь <code>NEXT_PUBLIC_MAPBOX_TOKEN</code> в <code>.env.local</code></div>;
   }
 
   return (
@@ -1093,20 +1414,28 @@ export function AkmolaMap({
 
       {/* Layer switcher */}
       <div style={styles.layerBar}>
-        {LAYERS.map(({ value, label }) => (
-          <button
-            key={value}
-            onClick={() => onLayerChange(value)}
-            style={{
-              ...styles.layerBtn,
-              background: layer === value ? "#22c55e" : "rgba(13,17,23,0.82)",
-              color: layer === value ? "#fff" : "#8b949e",
-              borderColor: layer === value ? "#22c55e" : "rgba(255,255,255,0.08)",
-            }}
-          >
-            {label}
-          </button>
-        ))}
+        <button
+          onClick={() => onLayerChange(layer === "water" ? "all" : "water")}
+          style={{
+            ...styles.layerBtn,
+            background: layer === "water" ? "#22c55e" : "rgba(13,17,23,0.82)",
+            color: layer === "water" ? "#fff" : "#8b949e",
+            borderColor: layer === "water" ? "#22c55e" : "rgba(255,255,255,0.08)",
+          }}
+        >
+          Водные объекты
+        </button>
+        <button
+          onClick={onToggleHydroposts}
+          style={{
+            ...styles.layerBtn,
+            background: showHydroposts ? "#22c55e" : "rgba(13,17,23,0.82)",
+            color: showHydroposts ? "#fff" : "#8b949e",
+            borderColor: showHydroposts ? "#22c55e" : "rgba(255,255,255,0.08)",
+          }}
+        >
+          Гидропосты
+        </button>
         <button
           onClick={onTogglePlaces}
           style={{
@@ -1133,28 +1462,83 @@ export function AkmolaMap({
           onClick={handleStyleToggle}
           style={{
             ...styles.layerBtn,
-            background: mapStyle === "satellite" ? "#0ea5e9" : "rgba(13,17,23,0.82)",
-            color: mapStyle === "satellite" ? "#fff" : "#8b949e",
-            borderColor: mapStyle === "satellite" ? "#0ea5e9" : "rgba(255,255,255,0.08)",
+            background: mapStyle === "imagery" ? "#0ea5e9" : "rgba(13,17,23,0.82)",
+            color: mapStyle === "imagery" ? "#fff" : "#8b949e",
+            borderColor: mapStyle === "imagery" ? "#0ea5e9" : "rgba(255,255,255,0.08)",
           }}
         >
-          {mapStyle === "satellite" ? "Карта" : "Спутник"}
+          {STYLE_LABEL[mapStyle]}
+        </button>
+        <button
+          onClick={() => setShowTerrain((v) => !v)}
+          style={{
+            ...styles.layerBtn,
+            background: showTerrain ? "#8b5cf6" : "rgba(13,17,23,0.82)",
+            color: showTerrain ? "#fff" : "#8b949e",
+            borderColor: showTerrain ? "#8b5cf6" : "rgba(255,255,255,0.08)",
+          }}
+        >
+          ⛰ 3D
+        </button>
+        <button
+          onClick={() => setShowRelief((v) => !v)}
+          style={{
+            ...styles.layerBtn,
+            background: showRelief ? "#16a34a" : "rgba(13,17,23,0.82)",
+            color: showRelief ? "#fff" : "#8b949e",
+            borderColor: showRelief ? "#16a34a" : "rgba(255,255,255,0.08)",
+          }}
+        >
+          🎨 Топография
         </button>
       </div>
+
+      {/* Elevation color legend — vertical scale on the right, rescales with the view */}
+      {showRelief && (
+        <div style={styles.reliefLegend}>
+          <div style={styles.reliefLegendTitle}>Высота, м</div>
+          <div style={styles.reliefLegendRow}>
+            <div style={styles.reliefLegendBar}>
+              {[...RELIEF_RELATIVE_STOPS].reverse().map((stop) => (
+                <div key={stop.t} style={{ flex: 1, background: stop.color }} />
+              ))}
+            </div>
+            <div style={styles.reliefLegendLabels}>
+              {[...RELIEF_RELATIVE_STOPS].reverse().map((stop) => (
+                <span key={stop.t}>
+                  {Math.round(reliefRange.min + stop.t * (reliefRange.max - reliefRange.min))}
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Satellite overlay status/error */}
+      {showSatellite && satelliteDate && (
+        <div style={styles.satelliteHint}>
+          Снимок Sentinel-2 от {new Date(satelliteDate).toLocaleDateString("ru-RU")}
+        </div>
+      )}
+      {satelliteError && (
+        <div style={{ ...styles.satelliteHint, color: "#ef4444", borderColor: "#ef444440" }}>
+          {satelliteError}
+        </div>
+      )}
 
       {/* Measure hint */}
       {isMeasureMode && (
         <div style={styles.measureHint}>
-          {measureStep === 1 ? "Теперь кликни вторую точку на реке" : "Кликни первую точку на реке"}
+          {measureStep === 1 ? "Теперь кликни вторую точку" : "Кликни первую точку — расстояние по прямой"}
         </div>
       )}
 
       {/* Water trace hint */}
       {isWaterTraceMode && (
-        <div style={styles.traceHint}>
-          {traceStep === 1
+        <div style={traceMsg ? styles.traceHintError : styles.traceHint}>
+          {traceMsg ?? (traceStep === 1
             ? "Теперь кликни вторую точку — гидропост, нас. пункт или место на реке"
-            : "Кликни первую точку — гидропост, населённый пункт или место на реке"}
+            : "Кликни первую точку — гидропост, населённый пункт или место на реке")}
         </div>
       )}
 
@@ -1200,9 +1584,39 @@ const styles = {
     backdropFilter: "blur(6px)", zIndex: 10, pointerEvents: "none" as const,
     whiteSpace: "nowrap" as const, maxWidth: "90%", textAlign: "center" as const,
   },
+  traceHintError: {
+    position: "absolute" as const, bottom: 52, left: "50%", transform: "translateX(-50%)",
+    background: "rgba(13,17,23,0.9)", color: "#ef4444", border: "1px solid #ef444440",
+    borderRadius: 8, padding: "6px 14px", fontSize: 13, fontWeight: 500,
+    backdropFilter: "blur(6px)", zIndex: 10, pointerEvents: "none" as const,
+    maxWidth: "90%", textAlign: "center" as const,
+  },
+  satelliteHint: {
+    position: "absolute" as const, top: 56, left: 12,
+    background: "rgba(13,17,23,0.9)", color: "#22d3ee", border: "1px solid #22d3ee40",
+    borderRadius: 8, padding: "5px 12px", fontSize: 12, fontWeight: 500,
+    backdropFilter: "blur(6px)", zIndex: 10, pointerEvents: "none" as const,
+  },
   layerBtn: {
     padding: "6px 14px", borderRadius: 8, border: "1px solid", cursor: "pointer",
     fontSize: 13, fontWeight: 500, backdropFilter: "blur(6px)", transition: "all 0.15s",
+  },
+  reliefLegend: {
+    position: "absolute" as const, top: "50%", right: 12, transform: "translateY(-50%)",
+    background: "rgba(13,17,23,0.9)", border: "1px solid rgba(255,255,255,0.1)",
+    borderRadius: 8, padding: "10px 10px 12px", backdropFilter: "blur(6px)", zIndex: 10,
+  },
+  reliefLegendTitle: {
+    fontSize: 11, color: "#8b949e", textAlign: "center" as const, marginBottom: 6,
+  },
+  reliefLegendRow: { display: "flex", gap: 6, alignItems: "stretch" },
+  reliefLegendBar: {
+    width: 14, height: 180, borderRadius: 4, overflow: "hidden",
+    display: "flex", flexDirection: "column" as const, border: "1px solid rgba(255,255,255,0.15)",
+  },
+  reliefLegendLabels: {
+    height: 180, display: "flex", flexDirection: "column" as const, justifyContent: "space-between",
+    fontSize: 10, color: "#c9d1d9", fontVariantNumeric: "tabular-nums" as const,
   },
   zoomBtns: {
     position: "absolute" as const, bottom: 96, right: 12,

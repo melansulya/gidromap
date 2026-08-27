@@ -3,28 +3,33 @@
 import { useState, useCallback } from "react";
 import { AkmolaMap } from "@/components/AkmolaMap";
 import { ChatPanel } from "@/components/ChatPanel";
+import { KazakhstanOverview } from "@/components/KazakhstanOverview";
 import { PostDetailPanel } from "@/components/PostDetailPanel";
 import { WaterObjectPanel } from "@/components/WaterObjectPanel";
 import { WeatherWidget } from "@/components/WeatherWidget";
 import { hydroposts } from "@/lib/akmolaMapData";
 import { track } from "@/lib/track";
-import type { Layer, MapState, WaterObject } from "@/lib/types";
+import type { Layer, MapState, Region, WaterObject } from "@/lib/types";
 import type { MeasureResult, WaterTraceResult } from "@/lib/measure";
 
-const INIT: MapState = {
-  activePostCode: hydroposts[0]?.code ?? null,
-  highlightedPostCodes: [],
-  highlightedWaterIds: [],
-  highlightedPlaceIds: [],
-  highlightedDistricts: [],
-  suggestedPlacements: [],
-  layer: "hydroposts",
-  showPlaces: false,
-  showDistricts: true,
-};
+function initMapState(region: Region): MapState {
+  return {
+    activePostCode: hydroposts.find((p) => p.region === region)?.code ?? null,
+    highlightedPostCodes: [],
+    highlightedWaterIds: [],
+    highlightedPlaceIds: [],
+    highlightedDistricts: [],
+    suggestedPlacements: [],
+    layer: "all",
+    showPlaces: false,
+    showDistricts: true,
+    showHydroposts: true,
+  };
+}
 
 export default function Page() {
-  const [mapState, setMapState] = useState<MapState>(INIT);
+  const [selectedRegion, setSelectedRegion] = useState<Region | null>(null);
+  const [mapState, setMapState] = useState<MapState>(() => initMapState("akmola"));
   const [isMeasureMode, setIsMeasureMode] = useState(false);
   const [measureResult, setMeasureResult] = useState<MeasureResult | null>(null);
   const [detailPostCode, setDetailPostCode] = useState<number | null>(null);
@@ -35,6 +40,22 @@ export default function Page() {
 
   const updateMap = useCallback((patch: Partial<MapState>) => {
     setMapState((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const handleSelectRegion = useCallback((next: Region) => {
+    setSelectedRegion(next);
+    setMapState(initMapState(next));
+    setDetailPostCode(null);
+    setDetailWater(null);
+    setIsMeasureMode(false);
+    setMeasureResult(null);
+    setIsWaterTraceMode(false);
+    setWaterTraceResult(null);
+    track("switch_region", { region: next });
+  }, []);
+
+  const handleBackToOverview = useCallback(() => {
+    setSelectedRegion(null);
   }, []);
 
   const handlePostClick = useCallback(
@@ -89,6 +110,7 @@ export default function Page() {
   const handleLayerChange = useCallback((layer: Layer) => updateMap({ layer }), [updateMap]);
   const handleTogglePlaces = useCallback(() => updateMap({ showPlaces: !mapState.showPlaces }), [updateMap, mapState.showPlaces]);
   const handleToggleDistricts = useCallback(() => updateMap({ showDistricts: !mapState.showDistricts }), [updateMap, mapState.showDistricts]);
+  const handleToggleHydroposts = useCallback(() => updateMap({ showHydroposts: !mapState.showHydroposts }), [updateMap, mapState.showHydroposts]);
 
   const handleMeasureModeChange = useCallback((active: boolean) => {
     setIsMeasureMode(active);
@@ -103,10 +125,20 @@ export default function Page() {
     }
   }, []);
 
+  if (selectedRegion === null) {
+    return <KazakhstanOverview onSelectRegion={handleSelectRegion} />;
+  }
+
   return (
     <div className="app-shell">
       <div style={{ position: "relative", flex: 1, minWidth: 0, height: "100dvh", overflow: "hidden", display: "flex" }}>
+        <button onClick={handleBackToOverview} style={backButtonStyle}>
+          ← Казахстан
+        </button>
+
         <AkmolaMap
+          key={selectedRegion}
+          region={selectedRegion}
           activePostCode={mapState.activePostCode}
           highlightedPostCodes={mapState.highlightedPostCodes}
           highlightedWaterIds={mapState.highlightedWaterIds}
@@ -116,6 +148,7 @@ export default function Page() {
           layer={mapState.layer}
           showPlaces={mapState.showPlaces}
           showDistricts={mapState.showDistricts}
+          showHydroposts={mapState.showHydroposts}
           isMeasureMode={isMeasureMode}
           isWaterTraceMode={isWaterTraceMode}
           onPostClick={handlePostClick}
@@ -123,6 +156,7 @@ export default function Page() {
           onLayerChange={handleLayerChange}
           onTogglePlaces={handleTogglePlaces}
           onToggleDistricts={handleToggleDistricts}
+          onToggleHydroposts={handleToggleHydroposts}
           onMeasureResult={handleMeasureResult}
           onWaterTraceResult={handleWaterTraceResult}
         />
@@ -139,10 +173,11 @@ export default function Page() {
           </div>
         )}
 
-        <WeatherWidget onWeatherSummary={setWeatherSummary} />
+        <WeatherWidget region={selectedRegion} onWeatherSummary={setWeatherSummary} />
       </div>
 
       <ChatPanel
+        region={selectedRegion}
         activePostCode={mapState.activePostCode}
         highlightedPostCodes={mapState.highlightedPostCodes}
         isMeasureMode={isMeasureMode}
@@ -157,3 +192,23 @@ export default function Page() {
     </div>
   );
 }
+
+const backButtonStyle = {
+  position: "absolute" as const,
+  bottom: 16,
+  right: 12,
+  zIndex: 10,
+  display: "flex",
+  alignItems: "center",
+  gap: 4,
+  background: "rgba(13,17,23,0.82)",
+  border: "1px solid rgba(255,255,255,0.08)",
+  borderRadius: 10,
+  padding: "8px 14px",
+  color: "#8b949e",
+  fontSize: 13,
+  fontWeight: 500,
+  cursor: "pointer",
+  fontFamily: "inherit",
+  backdropFilter: "blur(6px)",
+};

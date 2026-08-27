@@ -8,7 +8,7 @@ import { logActivity } from "@/lib/activityLog";
 // allowing them here would let any authenticated user forge fake log entries
 // and skew the admin stats/activity views.
 const ActivityBodySchema = z.object({
-  action: z.enum(["view_hydropost", "view_water_object", "measure_distance", "water_trace", "export_doc"]),
+  action: z.enum(["view_hydropost", "view_water_object", "measure_distance", "water_trace", "export_doc", "switch_region"]),
   details: z.record(z.string(), z.unknown()).optional(),
 });
 

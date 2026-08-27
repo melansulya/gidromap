@@ -2,13 +2,14 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import type { ChatMessage, Clarification, ChatResponse, MapState } from "@/lib/types";
+import type { ChatMessage, Clarification, ChatResponse, MapState, Region } from "@/lib/types";
 import type { MeasureResult, WaterTraceResult } from "@/lib/measure";
 import { track } from "@/lib/track";
+import { TwoFactorModal } from "@/components/TwoFactorModal";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
-type AuthUser = { email: string; name: string; role: "admin" | "akim" | "deputy" };
+type AuthUser = { email: string; name: string; role: "admin" | "akim" | "deputy"; totpEnabled?: boolean };
 
 type LocalChat = {
   id: string;
@@ -45,6 +46,15 @@ function renderInline(text: string): React.ReactNode {
 
 function parseTableRow(line: string): string[] {
   return line.split("|").slice(1, -1).map((c) => c.trim());
+}
+
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/\*\*/g, "")
+    .replace(/^#+\s*/gm, "")
+    .replace(/^[-•]\s*/gm, "")
+    .replace(/\|/g, " ")
+    .trim();
 }
 
 function isTableSep(line: string): boolean {
@@ -122,6 +132,7 @@ function MarkdownBlock({ text }: { text: string }) {
 // ── Props ──────────────────────────────────────────────────────────────────────
 
 type Props = {
+  region: Region;
   activePostCode: number | null;
   highlightedPostCodes: number[];
   isMeasureMode: boolean;
@@ -134,12 +145,20 @@ type Props = {
   onWaterTraceModeChange: (active: boolean) => void;
 };
 
-const QUICK_PROMPTS = [
-  "Покажи гидропосты на Нуре",
-  "Какие посты в красной зоне?",
-  "Гидропосты на Есиле",
-  "Сколько постов в warning?",
-];
+const QUICK_PROMPTS: Record<Region, string[]> = {
+  akmola: [
+    "Покажи гидропосты на Нуре",
+    "Какие посты в красной зоне?",
+    "Гидропосты на Есиле",
+    "Сколько постов в warning?",
+  ],
+  kyzylorda: [
+    "Покажи гидропосты на Сырдарье",
+    "Гидропосты в Аральском районе",
+    "Сколько постов в Кармакшинском районе?",
+    "Что за пост Тасбугет?",
+  ],
+};
 
 let msgCounter = 0;
 function uid() { return String(++msgCounter); }
@@ -182,11 +201,12 @@ h1,h2,h3{color:#1a3c5e}li{margin-bottom:4px}hr{border:1px solid #ddd;margin:16px
   URL.revokeObjectURL(url);
 }
 
-export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode, measureResult, isWaterTraceMode, waterTraceResult, weatherContext, onMapUpdate, onMeasureModeChange, onWaterTraceModeChange }: Props) {
+export function ChatPanel({ region, activePostCode, highlightedPostCodes, isMeasureMode, measureResult, isWaterTraceMode, waterTraceResult, weatherContext, onMapUpdate, onMeasureModeChange, onWaterTraceModeChange }: Props) {
   const router = useRouter();
 
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authLoaded, setAuthLoaded] = useState(false);
+  const [show2fa, setShow2fa] = useState(false);
 
   const [chats, setChats] = useState<LocalChat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
@@ -197,10 +217,12 @@ export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode,
   const [loading, setLoading] = useState(false);
   const [clarification, setClarification] = useState<Clarification | null>(null);
   const [listening, setListening] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
 
   const bottomRef = useRef<HTMLDivElement>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const recRef = useRef<any>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // ── Auth check on mount ───────────────────────────────────────────────────
 
@@ -233,6 +255,14 @@ export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode,
     setClarification(null);
     setShowChatList(false);
   }
+
+  // Switching region starts a fresh chat — old messages/tool results may reference
+  // hydroposts, districts or rivers that don't exist in the newly selected region.
+  const didMountRegionRef = useRef(false);
+  useEffect(() => {
+    if (!didMountRegionRef.current) { didMountRegionRef.current = true; return; }
+    newChat();
+  }, [region]);
 
   function selectChat(chat: LocalChat) {
     setActiveChatId(chat.id);
@@ -287,7 +317,7 @@ export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode,
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, sessionId: chatId, mapContext }),
+        body: JSON.stringify({ query, sessionId: chatId, mapContext, region }),
       });
 
       const data: ChatResponse = await res.json();
@@ -320,20 +350,72 @@ export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode,
     send(input);
   }
 
-  function handleVoice() {
-    if (listening) { recRef.current?.stop(); setListening(false); return; }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const SR = typeof window !== "undefined" && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
-    if (!SR) { alert("Голосовой ввод не поддерживается в этом браузере"); return; }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const rec: any = new SR();
-    rec.lang = "ru-RU"; rec.interimResults = false; rec.maxAlternatives = 1;
-    rec.onstart = () => setListening(true);
-    rec.onend = () => setListening(false);
-    rec.onerror = () => setListening(false);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    rec.onresult = (e: any) => send(e.results[0][0].transcript);
-    rec.start(); recRef.current = rec;
+  async function handleVoice() {
+    if (listening) { mediaRecorderRef.current?.stop(); return; }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      alert("Голосовой ввод не поддерживается в этом браузере");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const chunks: BlobPart[] = [];
+      const rec = new MediaRecorder(stream);
+
+      rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      rec.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setListening(false);
+        setTranscribing(true);
+        try {
+          const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+          const form = new FormData();
+          form.append("audio", blob, "voice.webm");
+          const res = await fetch("/api/transcribe", { method: "POST", body: form });
+          const data = await res.json() as { text?: string; error?: string };
+          if (data.text?.trim()) send(data.text.trim());
+          else alert("Не удалось распознать речь");
+        } catch {
+          alert("Не удалось распознать речь");
+        } finally {
+          setTranscribing(false);
+        }
+      };
+
+      rec.start();
+      mediaRecorderRef.current = rec;
+      setListening(true);
+    } catch {
+      alert("Нет доступа к микрофону");
+    }
+  }
+
+  async function handleSpeak(msg: ChatMessage) {
+    if (speakingId === msg.id) {
+      audioRef.current?.pause();
+      setSpeakingId(null);
+      return;
+    }
+    audioRef.current?.pause();
+    setSpeakingId(msg.id);
+    try {
+      const res = await fetch("/api/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: stripMarkdown(msg.text) }),
+      });
+      if (!res.ok) throw new Error("speak failed");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.onended = () => setSpeakingId(null);
+      audio.onerror = () => setSpeakingId(null);
+      await audio.play();
+    } catch {
+      setSpeakingId(null);
+      alert("Не удалось озвучить ответ");
+    }
   }
 
   // ── Loading state ─────────────────────────────────────────────────────────
@@ -359,6 +441,7 @@ export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode,
       <div style={s.header}>
         <span style={s.badge}>AI Gidromap</span>
         <div style={s.headerRight}>
+          <a href="/dashboard" style={s.adminBtn} title="Дашборд — сводка по региону">📊</a>
           {authUser?.role === "admin" && (
             <a href="/admin" style={s.adminBtn} title="Управление пользователями">⚙</a>
           )}
@@ -401,9 +484,23 @@ export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode,
             style={{ ...s.iconBtn, color: showChatList ? "#60a5fa" : "#6e7681" }}
             title="История чатов"
           >≡</button>
+          <button
+            onClick={() => setShow2fa(true)}
+            style={{ ...s.iconBtn, color: authUser?.totpEnabled ? "#22c55e" : "#6e7681" }}
+            title={authUser?.totpEnabled ? "2FA включена" : "Настроить 2FA"}
+          >🔒</button>
           <button onClick={handleLogout} style={s.iconBtn} title="Выйти">↩</button>
         </div>
       </div>
+
+      {show2fa && authUser && (
+        <TwoFactorModal
+          email={authUser.email}
+          enabled={authUser.totpEnabled ?? false}
+          onClose={() => setShow2fa(false)}
+          onChanged={(enabled) => setAuthUser((u) => (u ? { ...u, totpEnabled: enabled } : u))}
+        />
+      )}
 
       {/* Chat list */}
       {showChatList ? (
@@ -444,6 +541,11 @@ export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode,
                   <MarkdownBlock text={msg.text} />
                   <div style={{ display: "flex", justifyContent: "flex-end", gap: 4, marginTop: 4 }}>
                     <button
+                      onClick={() => handleSpeak(msg)}
+                      style={s.downloadBtn}
+                      title={speakingId === msg.id ? "Остановить" : "Озвучить"}
+                    >{speakingId === msg.id ? "⏸" : "🔊"}</button>
+                    <button
                       onClick={() => {
                         const date = new Date().toLocaleDateString("ru-RU");
                         downloadMd(`# AI Gidromap — Ответ ИИ\n_${date}_\n\n---\n\n${msg.text}`, `gidromap-${Date.now()}.md`);
@@ -482,7 +584,7 @@ export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode,
       {/* Quick prompts */}
       {!showChatList && messages.length === 0 && (
         <div style={s.quickList}>
-          {QUICK_PROMPTS.map((p) => (
+          {QUICK_PROMPTS[region].map((p) => (
             <button key={p} style={s.quickBtn} onClick={() => send(p)}>{p}</button>
           ))}
         </div>
@@ -534,7 +636,7 @@ export function ChatPanel({ activePostCode, highlightedPostCodes, isMeasureMode,
 
       {/* Input */}
       <form onSubmit={handleSubmit} style={s.form}>
-        <button type="button" onClick={handleVoice} title="Голосовой ввод" style={{ ...s.rulerBtn, background: listening ? "#ef444418" : "transparent", color: listening ? "#ef4444" : "#6e7681", borderColor: listening ? "#ef444440" : "rgba(255,255,255,0.08)", animation: listening ? "pulse 1s infinite" : "none" }}>🎙</button>
+        <button type="button" onClick={handleVoice} disabled={transcribing} title={transcribing ? "Распознаётся…" : "Голосовой ввод"} style={{ ...s.rulerBtn, background: listening ? "#ef444418" : "transparent", color: listening ? "#ef4444" : "#6e7681", borderColor: listening ? "#ef444440" : "rgba(255,255,255,0.08)", animation: listening ? "pulse 1s infinite" : "none", opacity: transcribing ? 0.6 : 1 }}>{transcribing ? "…" : "🎙"}</button>
         <textarea style={s.textarea} value={input} onChange={(e) => setInput(e.target.value)} placeholder={isMeasureMode ? "Кликай по рекам на карте…" : isWaterTraceMode ? "Кликай точки на карте…" : "Любой вопрос…"} rows={2} disabled={isMeasureMode || isWaterTraceMode} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } }} />
         <button type="submit" disabled={loading || !input.trim() || isMeasureMode || isWaterTraceMode} style={s.sendBtn}>{loading ? "…" : "→"}</button>
       </form>

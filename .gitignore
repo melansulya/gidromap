@@ -46,3 +46,9 @@ next-env.d.ts
 # large GIS source datasets (not needed for app runtime)
 HydroRIVERS_v10_as_shp/
 kazakhstan-260513-free/
+
+# cached Sentinel satellite image (regenerated on demand, always overwritten)
+/.cache/
+
+# terrain tiles (large binary, built once locally — see data/README if regenerating)
+/data/*.mbtiles

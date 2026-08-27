@@ -34,11 +34,11 @@ async function getKey(secret: string): Promise<CryptoKey> {
   );
 }
 
-export async function signJWT(payload: object, secret: string): Promise<string> {
+export async function signJWT(payload: object, secret: string, expiresInSeconds = 60 * 60 * 24 * 7): Promise<string> {
   const key = await getKey(secret);
   const now = Math.floor(Date.now() / 1000);
   const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const body = b64url(JSON.stringify({ ...payload, iat: now, exp: now + 60 * 60 * 24 * 7 }));
+  const body = b64url(JSON.stringify({ ...payload, iat: now, exp: now + expiresInSeconds }));
   const raw = await crypto.subtle.sign(ALG, key, new TextEncoder().encode(`${header}.${body}`));
   return `${header}.${body}.${b64urlBytes(new Uint8Array(raw))}`;
 }
