@@ -936,6 +936,7 @@ get_river_widths — реки/участки рек шириной от зада
 • "выдели реку [название]" / "покажи реку [название]" → highlight_water(water_name=[название])
 • "выдели р. ${meta.exampleRiver}" → highlight_water(water_name="${meta.exampleRiver}")
 • "риск маловодья на р. [название]" → detect_low_water_risk(river=...)
+• "самый опасный/критичный гидропост" (без указания реки/района) → filter_hydroposts(status="danger", sort_by="level_desc") и назови пост с наименьшим отклонением от нормы из результата — НИКОГДА не вызывай detect_low_water_risk без river или post_code и не придумывай post_code самостоятельно
 • "динамика на [река]" → filter_hydroposts + get_hydropost_history для каждого поста
 • "сёла вдоль [река]" → find_settlements_near_posts(river=..., radius_km=20)
 • "реки шириной от N метров" / "какие реки широкие" → get_river_widths(min_width_m=N)
