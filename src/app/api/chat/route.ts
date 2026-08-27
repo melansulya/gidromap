@@ -961,6 +961,14 @@ type DeepSeekMessage = {
   tool_call_id?: string;
 };
 
+// Qwen3 via Ollama has a documented multi-turn bug: a reply that thinks then
+// calls a tool with no other text leaves an unclosed <think> tag, corrupting
+// every later turn (ollama/ollama#14493, #11135). Strip any think-tag remnants
+// (closed or not) from history before resending, regardless of root cause.
+function stripThinkTags(content: string): string {
+  return content.replace(/<think>[\s\S]*?(<\/think>|$)/gi, "").trim();
+}
+
 // Keeps the most recent messages, then drops any leading "tool" messages —
 // a tool result is only valid immediately after the assistant message that
 // requested it, so a slice can't safely start mid-tool-exchange.
@@ -976,8 +984,10 @@ function trimPriorForLocalModel(prior: DeepSeekMessage[], maxMessages = 4): Deep
   while (trimmed.length > 0 && trimmed[0].role === "tool") trimmed = trimmed.slice(1);
   return trimmed.map((m, i) => {
     const isLast = i === trimmed.length - 1;
-    if (!isLast && m.role === "assistant" && m.content && m.content.length > 150) {
-      return { ...m, content: `${m.content.slice(0, 150)}…` };
+    if (m.role === "assistant" && m.content) {
+      const cleaned = stripThinkTags(m.content);
+      if (!isLast && cleaned.length > 150) return { ...m, content: `${cleaned.slice(0, 150)}…` };
+      if (cleaned !== m.content) return { ...m, content: cleaned };
     }
     return m;
   });
