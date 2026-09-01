@@ -1042,6 +1042,12 @@ async function runAgent(
         messages,
         tools: TOOLS,
         tool_choice: "auto",
+        // Local model defaults to a fairly high sampling temperature, which on a
+        // small model sometimes means explaining what tool it should call instead
+        // of actually calling it (observed live on ambiguous queries). Lower
+        // temperature trades a little creativity for more consistent instruction-
+        // following. DeepSeek keeps its own default — this isn't a problem there.
+        ...(LLM_BACKEND === "ollama" ? { temperature: 0.2 } : {}),
         // Generation is the slow half of every local-inference turn (a 219-token
         // reply took 88 of 131 total seconds in testing) — cap it tighter than
         // DeepSeek's budget to keep worst-case answers from running long.
