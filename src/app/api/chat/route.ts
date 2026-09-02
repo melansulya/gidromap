@@ -581,7 +581,9 @@ function execFindSettlementsNearPosts(args: {
       cities: matchedPlaces
         .filter((p) => p.kind === "city" || p.kind === "town")
         .map((p) => p.name),
-      villages: matchedPlaces.filter((p) => p.kind === "village" || p.kind === "suburb").length,
+      villages: matchedPlaces
+        .filter((p) => p.kind === "village" || p.kind === "suburb")
+        .map((p) => p.name),
     },
     mapUpdate: {
       highlightedPlaceIds: [...matched],
