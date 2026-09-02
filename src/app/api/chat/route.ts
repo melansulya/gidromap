@@ -1062,13 +1062,14 @@ async function runAgent(
         // temperature trades a little creativity for more consistent instruction-
         // following. DeepSeek keeps its own default — this isn't a problem there.
         ...(LLM_BACKEND === "ollama" ? { temperature: 0.2 } : {}),
-        // Generation is the slow half of every local-inference turn, so this stays
-        // tighter than DeepSeek's budget — but 350 was too tight for Qwen3-8B's
-        // reasoning_content (--reasoning-format deepseek exposes its chain-of-thought
-        // as a separate field, which itself eats into this budget): a real multi-tool
-        // question got cut off mid-response, producing a malformed reply the app
-        // couldn't render at all. 700 leaves room for reasoning + an actual answer.
-        max_tokens: LLM_BACKEND === "ollama" ? 700 : 1200,
+        // Qwen3-8B's exposed reasoning_content (--reasoning-format deepseek) can run
+        // to several hundred tokens by itself on a genuinely complex multi-tool
+        // question, on top of the actual answer — both 350 and 700 got cut off
+        // mid-response on the same real question, producing a malformed reply the
+        // app couldn't render at all. A truncated answer is worse than a slow one,
+        // so this now matches DeepSeek's budget instead of trying to guess a tighter
+        // number that's still wrong for the hard cases.
+        max_tokens: 1200,
       }),
     });
 
