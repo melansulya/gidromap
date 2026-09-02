@@ -1062,10 +1062,13 @@ async function runAgent(
         // temperature trades a little creativity for more consistent instruction-
         // following. DeepSeek keeps its own default — this isn't a problem there.
         ...(LLM_BACKEND === "ollama" ? { temperature: 0.2 } : {}),
-        // Generation is the slow half of every local-inference turn (a 219-token
-        // reply took 88 of 131 total seconds in testing) — cap it tighter than
-        // DeepSeek's budget to keep worst-case answers from running long.
-        max_tokens: LLM_BACKEND === "ollama" ? 350 : 1200,
+        // Generation is the slow half of every local-inference turn, so this stays
+        // tighter than DeepSeek's budget — but 350 was too tight for Qwen3-8B's
+        // reasoning_content (--reasoning-format deepseek exposes its chain-of-thought
+        // as a separate field, which itself eats into this budget): a real multi-tool
+        // question got cut off mid-response, producing a malformed reply the app
+        // couldn't render at all. 700 leaves room for reasoning + an actual answer.
+        max_tokens: LLM_BACKEND === "ollama" ? 700 : 1200,
       }),
     });
 
