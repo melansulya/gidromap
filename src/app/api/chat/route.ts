@@ -173,7 +173,7 @@ const TOOLS = [
     function: {
       name: "filter_hydroposts",
       description:
-        "Найти гидропосты по статусу, реке или району. Используй когда нужно показать/выделить посты на карте.",
+        "Найти гидропосты по статусу, реке, району или названию населённого пункта. Используй когда нужно показать/выделить посты на карте.",
       parameters: {
         type: "object",
         properties: {
@@ -184,6 +184,11 @@ const TOOLS = [
           },
           river: { type: "string", description: "Название реки (частичное совпадение)" },
           district: { type: "string", description: "Название района" },
+          search: {
+            type: "string",
+            description:
+              "Поиск по названию населённого пункта поста (частичное совпадение) — используй, когда пользователь называет посёлок/город/село, а не реку. Например 'Буденовка' — это название села у поста, НЕ название реки.",
+          },
           sort_by: {
             type: "string",
             enum: ["level_desc", "level_asc", "none"],
@@ -406,6 +411,7 @@ function execFilterHydroposts(args: {
   status: string;
   river?: string;
   district?: string;
+  search?: string;
   sort_by?: string;
 }, region: Region): ToolResult {
   let posts = hydropostsFor(region);
@@ -419,6 +425,10 @@ function execFilterHydroposts(args: {
   if (args.district) {
     const d = args.district.toLowerCase();
     posts = posts.filter((p) => p.district.toLowerCase().includes(d));
+  }
+  if (args.search) {
+    const s = args.search.toLowerCase();
+    posts = posts.filter((p) => p.label.toLowerCase().includes(s));
   }
   if (args.sort_by === "level_desc") posts.sort((a, b) => b.waterLevel - a.waterLevel);
   if (args.sort_by === "level_asc") posts.sort((a, b) => a.waterLevel - b.waterLevel);
@@ -892,7 +902,8 @@ ${meta.factsBlock}
 ИНСТРУМЕНТЫ КАРТЫ:
 
 filter_hydroposts — подсветить посты, автоматически выделяет и район
-  → status: danger/warning/normal/any | river: название реки | district: название района
+  → status: danger/warning/normal/any | river: название реки | district: название района | search: название населённого пункта
+  → ВАЖНО: если пользователь называет посёлок/город/село (например "пост у Буденовки") — это НЕ название реки, используй search, а не river
 
 highlight_district — подсветить район(ы) оранжевой рамкой на карте
   → ОБЯЗАТЕЛЬНО вызывай при: "выдели район", "покажи район", "выдели его", "покажи на карте", "отметь район"
@@ -939,6 +950,7 @@ get_river_widths — реки/участки рек шириной от зада
 • "самый опасный/критичный гидропост" (без указания реки/района) → filter_hydroposts(status="danger", sort_by="level_desc") и назови пост с наименьшим отклонением от нормы из результата — НИКОГДА не вызывай detect_low_water_risk без river или post_code и не придумывай post_code самостоятельно
 • "динамика на [река]" → filter_hydroposts + get_hydropost_history для каждого поста
 • "сёла вдоль [река]" → find_settlements_near_posts(river=..., radius_km=20)
+• "населённые пункты рядом с постом у [посёлок]" → сначала filter_hydroposts(status="any", search=[посёлок]) чтобы узнать реку этого поста, ПОТОМ find_settlements_near_posts(river=<найденная река>, radius_km=...)
 • "реки шириной от N метров" / "какие реки широкие" → get_river_widths(min_width_m=N)
 
 ━━ ПРАВИЛА ━━
