@@ -35,13 +35,9 @@ export type Hydropost = {
   region: Region;
 };
 
-export type WaterObject = {
-  id: string;
-  name: string;
-  kind: "river" | "lake" | "reservoir";
-  geometry: "polyline" | "polygon";
-  coordinates: [number, number][] | [number, number][][];
-};
+export function hydropostsFor(region: Region): Hydropost[] {
+  return hydroposts.filter((p) => p.region === region);
+}
 
 export const hydroposts: Hydropost[] = [
   {
@@ -912,8 +908,6 @@ export const hydropostHistoryByCode: Record<number, HydropostHistoryDataset> = {
     stats: { years: 3, peakOpenWaterCm: 956, peakYearCm: 995, lowestOpenWaterCm: 676 },
   },
 };
-
-export const waterObjects: WaterObject[] = [];
 
 // ─── Low water risk analysis ──────────────────────────────────────────────────
 

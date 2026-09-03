@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { hydroposts as allHydroposts, type Hydropost } from "@/lib/akmolaMapData";
+import { hydropostsFor, type Hydropost } from "@/lib/akmolaMapData";
 import type { Layer, Place, Region, SuggestedPlacement, WaterObject } from "@/lib/types";
 import {
   buildGraph,
@@ -97,35 +97,57 @@ function fetchWaterObjects(region: Region): Promise<WaterObject[]> {
   return pending;
 }
 
+// Shared shape behind fetchPlaces/fetchDistricts/fetchBorder below: cache the
+// resolved value per region, and cache the in-flight promise too so concurrent
+// calls for the same region (e.g. two components mounting at once) share one
+// network request instead of firing duplicates.
+function fetchCachedRegionJson<T>(
+  cache: Map<Region, T>,
+  pendingCache: Map<Region, Promise<T>>,
+  region: Region,
+  url: string,
+  transform: (raw: unknown) => T,
+  fallback: T,
+): Promise<T> {
+  const cached = cache.get(region);
+  if (cached) return Promise.resolve(cached);
+  let pending = pendingCache.get(region);
+  if (!pending) {
+    pending = fetch(url)
+      .then((r) => r.json())
+      .then((raw) => { const result = transform(raw); cache.set(region, result); return result; })
+      .catch(() => fallback);
+    pendingCache.set(region, pending);
+  }
+  return pending;
+}
+
+const placesLoadPromise = new Map<Region, Promise<Place[]>>();
 function fetchPlaces(region: Region): Promise<Place[]> {
-  const cached = placesCacheMap.get(region);
-  if (cached) return Promise.resolve(cached);
-  return fetch(`/${region}-places.json`)
-    .then((r) => r.json() as Promise<Place[]>)
-    .then((d) => { placesCacheMap.set(region, d); return d; })
-    .catch(() => []);
+  return fetchCachedRegionJson(
+    placesCacheMap, placesLoadPromise, region,
+    `/${region}-places.json`, (raw) => raw as Place[], [],
+  );
 }
 
+const districtsLoadPromise = new Map<Region, Promise<DistrictFeature[]>>();
 function fetchDistricts(region: Region): Promise<DistrictFeature[]> {
-  const cached = districtsCache.get(region);
-  if (cached) return Promise.resolve(cached);
-  return fetch(`/${region}-districts.geojson`)
-    .then((r) => r.json())
-    .then((d) => { const features = d?.features ?? []; districtsCache.set(region, features); return features; })
-    .catch(() => []);
+  return fetchCachedRegionJson(
+    districtsCache, districtsLoadPromise, region,
+    `/${region}-districts.geojson`,
+    (raw) => (raw as { features?: DistrictFeature[] })?.features ?? [], [],
+  );
 }
 
+const borderLoadPromise = new Map<Region, Promise<[number, number][][]>>();
 function fetchBorder(region: Region): Promise<[number, number][][]> {
-  const cached = borderCache.get(region);
-  if (cached) return Promise.resolve(cached);
-  return fetch(`/${region}-border.geojson`)
-    .then((r) => r.json())
-    .then((d) => { const rings = d?.features?.[0]?.geometry?.coordinates ?? []; borderCache.set(region, rings); return rings; })
-    .catch(() => []);
-}
-
-function hydropostsFor(region: Region): Hydropost[] {
-  return allHydroposts.filter((p) => p.region === region);
+  return fetchCachedRegionJson(
+    borderCache, borderLoadPromise, region,
+    `/${region}-border.geojson`,
+    (raw) => (raw as { features?: Array<{ geometry?: { coordinates?: [number, number][][] } }> })
+      ?.features?.[0]?.geometry?.coordinates ?? [],
+    [],
+  );
 }
 
 // ── Layer helpers (pure, no refs) ─────────────────────────────────────────────
@@ -343,54 +365,57 @@ function setupWaterLayers(
   }
 }
 
-function drawTracePath(map: maplibregl.Map, path: [number, number][]) {
-  if (map.getLayer("trace-path")) map.removeLayer("trace-path");
-  if (map.getSource("trace-path-src")) map.removeSource("trace-path-src");
-  if (path.length < 2) return;
-  map.addSource("trace-path-src", {
+// Shared shape behind the trace-path/measure-line pairs below: both draw a
+// single GeoJSON LineString source+layer, clearing any previous one first.
+function clearLineLayer(map: maplibregl.Map, layerId: string, sourceId: string) {
+  if (map.getLayer(layerId)) map.removeLayer(layerId);
+  if (map.getSource(sourceId)) map.removeSource(sourceId);
+}
+
+function drawLineLayer(
+  map: maplibregl.Map,
+  layerId: string,
+  sourceId: string,
+  coordinates: [number, number][],
+  paint: maplibregl.LineLayerSpecification["paint"],
+) {
+  clearLineLayer(map, layerId, sourceId);
+  map.addSource(sourceId, {
     type: "geojson",
     data: {
       type: "Feature",
       properties: {},
-      geometry: { type: "LineString", coordinates: path as number[][] },
-    },
+      geometry: { type: "LineString", coordinates },
+    } as GeoJSON.Feature<GeoJSON.LineString>,
   });
   map.addLayer({
-    id: "trace-path",
+    id: layerId,
     type: "line",
-    source: "trace-path-src",
+    source: sourceId,
     layout: { "line-join": "round", "line-cap": "round" },
-    paint: { "line-color": "#60a5fa", "line-width": 5, "line-opacity": 0.88 },
+    paint,
+  });
+}
+
+function drawTracePath(map: maplibregl.Map, path: [number, number][]) {
+  if (path.length < 2) { clearLineLayer(map, "trace-path", "trace-path-src"); return; }
+  drawLineLayer(map, "trace-path", "trace-path-src", path, {
+    "line-color": "#60a5fa", "line-width": 5, "line-opacity": 0.88,
   });
 }
 
 function clearTracePath(map: maplibregl.Map) {
-  if (map.getLayer("trace-path")) map.removeLayer("trace-path");
-  if (map.getSource("trace-path-src")) map.removeSource("trace-path-src");
+  clearLineLayer(map, "trace-path", "trace-path-src");
 }
 
 function drawMeasureLine(map: maplibregl.Map, from: [number, number], to: [number, number]) {
-  if (map.getLayer("measure-line")) map.removeLayer("measure-line");
-  if (map.getSource("measure-line-src")) map.removeSource("measure-line-src");
-  map.addSource("measure-line-src", {
-    type: "geojson",
-    data: {
-      type: "Feature", properties: {},
-      geometry: { type: "LineString", coordinates: [from, to] },
-    } as GeoJSON.Feature<GeoJSON.LineString>,
-  });
-  map.addLayer({
-    id: "measure-line",
-    type: "line",
-    source: "measure-line-src",
-    layout: { "line-join": "round", "line-cap": "round" },
-    paint: { "line-color": "#22d3ee", "line-width": 2, "line-dasharray": [5, 3], "line-opacity": 0.85 },
+  drawLineLayer(map, "measure-line", "measure-line-src", [from, to], {
+    "line-color": "#22d3ee", "line-width": 2, "line-dasharray": [5, 3], "line-opacity": 0.85,
   });
 }
 
 function clearMeasureLine(map: maplibregl.Map) {
-  if (map.getLayer("measure-line")) map.removeLayer("measure-line");
-  if (map.getSource("measure-line-src")) map.removeSource("measure-line-src");
+  clearLineLayer(map, "measure-line", "measure-line-src");
 }
 
 type SatelliteMeta = { bbox: [number, number, number, number]; imageUrl: string };

@@ -2,14 +2,23 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
-import { hydroposts as allHydroposts, getHydropostHistory, analyzeLowWaterRisk } from "@/lib/akmolaMapData";
+import { hydropostsFor, getHydropostHistory, analyzeLowWaterRisk } from "@/lib/akmolaMapData";
 import { runLocalMechanism } from "@/lib/aiMechanisms";
+import { haversineKm } from "@/lib/measure";
 import { getAuthFromToken } from "@/lib/auth";
 import { logActivity } from "@/lib/activityLog";
 import type { ChatResponse, MapState, Place, Region, RiverWidthSegment } from "@/lib/types";
 
-function hydropostsFor(region: Region) {
-  return allHydroposts.filter((p) => p.region === region);
+function filterByRiver<T extends { waterBody: string }>(items: T[], river?: string): T[] {
+  if (!river) return items;
+  const r = river.toLowerCase();
+  return items.filter((p) => p.waterBody.toLowerCase().includes(r));
+}
+
+function filterByDistrict<T extends { district: string }>(items: T[], district?: string): T[] {
+  if (!district) return items;
+  const d = district.toLowerCase();
+  return items.filter((p) => p.district.toLowerCase().includes(d));
 }
 
 // ─── Places cache ─────────────────────────────────────────────────────────────
@@ -18,28 +27,39 @@ const placesCache = new Map<Region, Place[]>();
 
 // ─── Water objects cache ──────────────────────────────────────────────────────
 
+// Reads a public/{region}-{filename} JSON file, cached per region — the shared
+// shape behind loadWaterObjects/loadRiverWidths/loadPlaces below (falls back to
+// `fallback` on any read/parse error, e.g. a data file not existing for a region).
+function loadJsonCached<T>(cache: Map<Region, T>, region: Region, loader: () => T, fallback: T): T {
+  const cached = cache.get(region);
+  if (cached) return cached;
+  let result: T;
+  try {
+    result = loader();
+  } catch {
+    result = fallback;
+  }
+  cache.set(region, result);
+  return result;
+}
+
+function readPublicJson<T>(region: Region, filename: string): T {
+  return JSON.parse(
+    fs.readFileSync(path.join(process.cwd(), "public", `${region}-${filename}`), "utf-8"),
+  ) as T;
+}
+
 type WaterEntry = { id: string; name: string };
 const waterCache2 = new Map<Region, WaterEntry[]>();
 
 function loadWaterObjects(region: Region): WaterEntry[] {
-  const cached = waterCache2.get(region);
-  if (cached) return cached;
-  let result: WaterEntry[];
-  try {
-    const bodies = JSON.parse(
-      fs.readFileSync(path.join(process.cwd(), "public", `${region}-water-bodies.json`), "utf-8")
-    ) as Array<{ id: string; name?: string }>;
-    const ways = JSON.parse(
-      fs.readFileSync(path.join(process.cwd(), "public", `${region}-waterways.json`), "utf-8")
-    ) as Array<{ id: string; name?: string }>;
-    result = [...bodies, ...ways]
+  return loadJsonCached(waterCache2, region, () => {
+    const bodies = readPublicJson<Array<{ id: string; name?: string }>>(region, "water-bodies.json");
+    const ways = readPublicJson<Array<{ id: string; name?: string }>>(region, "waterways.json");
+    return [...bodies, ...ways]
       .filter((w) => w.name && w.name.trim().length > 1)
       .map((w) => ({ id: w.id, name: w.name! }));
-  } catch {
-    result = [];
-  }
-  waterCache2.set(region, result);
-  return result;
+  }, []);
 }
 
 function findWaterIds(query: string, region: Region): string[] {
@@ -95,35 +115,11 @@ function findWaterIds(query: string, region: Region): string[] {
 const riverWidthCache = new Map<Region, RiverWidthSegment[]>();
 
 function loadRiverWidths(region: Region): RiverWidthSegment[] {
-  const cached = riverWidthCache.get(region);
-  if (cached) return cached;
-  let result: RiverWidthSegment[];
-  try {
-    result = JSON.parse(
-      fs.readFileSync(path.join(process.cwd(), "public", `${region}-river-widths.json`), "utf-8")
-    ) as RiverWidthSegment[];
-  } catch {
-    result = [];
-  }
-  riverWidthCache.set(region, result);
-  return result;
+  return loadJsonCached(riverWidthCache, region, () => readPublicJson<RiverWidthSegment[]>(region, "river-widths.json"), []);
 }
 
 function loadPlaces(region: Region): Place[] {
-  const cached = placesCache.get(region);
-  if (cached) return cached;
-  let result: Place[];
-  try {
-    const raw = fs.readFileSync(
-      path.join(process.cwd(), "public", `${region}-places.json`),
-      "utf-8",
-    );
-    result = JSON.parse(raw) as Place[];
-  } catch {
-    result = [];
-  }
-  placesCache.set(region, result);
-  return result;
+  return loadJsonCached(placesCache, region, () => readPublicJson<Place[]>(region, "places.json"), []);
 }
 
 function normName(s: string) {
@@ -146,23 +142,6 @@ function matchPlaceNames(names: string[], region: Region): string[] {
       );
     return found ? [found.id] : [];
   });
-}
-
-// ─── Haversine ────────────────────────────────────────────────────────────────
-
-function haversineKm(
-  [lng1, lat1]: [number, number],
-  [lng2, lat2]: [number, number],
-): number {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLng = ((lng2 - lng1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -418,14 +397,8 @@ function execFilterHydroposts(args: {
   if (args.status !== "any") {
     posts = posts.filter((p) => p.status === args.status);
   }
-  if (args.river) {
-    const r = args.river.toLowerCase();
-    posts = posts.filter((p) => p.waterBody.toLowerCase().includes(r));
-  }
-  if (args.district) {
-    const d = args.district.toLowerCase();
-    posts = posts.filter((p) => p.district.toLowerCase().includes(d));
-  }
+  posts = filterByRiver(posts, args.river);
+  posts = filterByDistrict(posts, args.district);
   if (args.search) {
     const s = args.search.toLowerCase();
     posts = posts.filter((p) => p.label.toLowerCase().includes(s));
@@ -548,14 +521,8 @@ function execFindSettlementsNearPosts(args: {
   const matched = new Set<string>();
 
   let targetPosts = hydropostsFor(region);
-  if (args.river) {
-    const r = args.river.toLowerCase();
-    targetPosts = targetPosts.filter((p) => p.waterBody.toLowerCase().includes(r));
-  }
-  if (args.district) {
-    const d = args.district.toLowerCase();
-    targetPosts = targetPosts.filter((p) => p.district.toLowerCase().includes(d));
-  }
+  targetPosts = filterByRiver(targetPosts, args.river);
+  targetPosts = filterByDistrict(targetPosts, args.district);
 
   for (const post of targetPosts) {
     for (const place of places) {
@@ -639,8 +606,7 @@ function execDetectLowWaterRisk(args: { post_code?: number; river?: string }, re
   if (args.post_code != null) {
     targets = targets.filter((p) => p.code === args.post_code);
   } else if (args.river) {
-    const r = args.river.toLowerCase();
-    targets = targets.filter((p) => p.waterBody.toLowerCase().includes(r));
+    targets = filterByRiver(targets, args.river);
   }
 
   if (targets.length === 0) {

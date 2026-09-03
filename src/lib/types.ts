@@ -39,11 +39,6 @@ export type Clarification = {
   queryBase: string;
 };
 
-export type ChatHistoryItem = {
-  role: "user" | "assistant";
-  content: string;
-};
-
 export type ChatResponse = {
   answer: string;
   mapUpdate: Partial<MapState> | null;
