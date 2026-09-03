@@ -12,7 +12,7 @@
 
 - This plan covers **post 13076 only**, as a proof of concept. Scaling to the other 18 posts in the Nura basin batch is explicitly out of scope for this plan — see "Follow-on phases" at the end.
 - **Long-term (seasonal) forecasting is out of scope for this plan** — it needs a different feature set (winter snow accumulation proxies aggregated over months, not daily lag features) and is a separate model; see "Follow-on phases."
-- Level values in `гидро/13076 H.xlsx` are already in centimeters — do **not** multiply by 100 (this was verified against the app's existing 1974-2022 history for this post across 25 overlapping years; see `docs/superpowers/plans` session notes — highest-year values matched within 1-2%).
+- Level values in `data/hydro-forecast-source/гидро/13076 H.xlsx` are already in centimeters — do **not** multiply by 100 (this was verified against the app's existing 1974-2022 history for this post across 25 overlapping years; see `docs/superpowers/plans` session notes — highest-year values matched within 1-2%).
 - Chronological train/test split is mandatory for all time-series validation in this plan — never shuffle randomly across years, since that leaks future information into training and would make validation metrics meaningless for a forecasting use case.
 - Ice-covered readings (see ICE_CHARS list in Task 1) are physically valid data and must stay in the training set — they are only excluded from the app's separate "open-water high" summary statistic, not from a forecast model, which needs the full year including winter behavior.
 
@@ -66,9 +66,9 @@ def test_is_ice_flag_ignores_non_ice_notes():
 
 def test_build_dataset_produces_expected_columns():
     df = build_dataset(
-        h_path="../../гидро/13076 H.xlsx",
-        q_path="../../гидро/13076 Q.xlsx",
-        meteo_path="../../метео/35382_5027160.csv",
+        h_path="../../data/hydro-forecast-source/гидро/13076 H.xlsx",
+        q_path="../../data/hydro-forecast-source/гидро/13076 Q.xlsx",
+        meteo_path="../../data/hydro-forecast-source/метео/35382_5027160.csv",
         post_code=13076,
     )
     assert list(df.columns) == ["date", "level_cm", "discharge_m3s", "ice_flag", "precip_mm", "temp_mean_c"]
@@ -162,9 +162,9 @@ def build_dataset(h_path: str, q_path: str, meteo_path: str, post_code: int) -> 
 
 if __name__ == "__main__":
     df = build_dataset(
-        h_path="../../гидро/13076 H.xlsx",
-        q_path="../../гидро/13076 Q.xlsx",
-        meteo_path="../../метео/35382_5027160.csv",
+        h_path="../../data/hydro-forecast-source/гидро/13076 H.xlsx",
+        q_path="../../data/hydro-forecast-source/гидро/13076 Q.xlsx",
+        meteo_path="../../data/hydro-forecast-source/метео/35382_5027160.csv",
         post_code=13076,
     )
     out_path = "../../data/forecast/post_13076_daily.csv"
