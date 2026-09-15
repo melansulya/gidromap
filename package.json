@@ -1,6 +1,7 @@
 {
   "name": "edumap-reset-site",
   "version": "0.1.0",
+  "description": "AI Gidromap — interactive Next.js map for monitoring hydroposts in Kazakhstan",
   "private": true,
   "scripts": {
     "dev": "next dev",
